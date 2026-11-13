@@ -1,138 +1,94 @@
-# tern-projects (Customized Fork)
+# tern-projects
 
-> **Fork Notice:** This repository is a customized fork of [thegeneralist01/tern-projects](https://github.com/thegeneralist01/tern-projects) (based on `v0.2.3` / `86c05d4`), maintained at [Haku0002/tern-projects](https://github.com/Haku0002/tern-projects).
->
-> **Key modifications over upstream:**
-> - **Pinned left sidebar & main-pane workspace**: opening or starting chats swaps/opens beside the sidebar instead of spawning new tabs by default; supports **Open in Main**, **Split Right**, **Split Down**, and **Open in New Tab**, plus live chat deduplication.
-> - **Collapsible sidebar & per-tab persistence**: collapse as **Hide**, **Icon rail**, or floating **Tile**, with per-tab auto-open, remembered width/collapse state, and optional selection card toggle.
-> - **Parked tile deck management**: foldable **Parked** section with live status, inline idle cleanup, direct tile closing, and a status-bar / command-palette picker.
-> - **Safe chat forking & `[Fork] ` prefixing**: fork OMP, Claude Code, and Codex chats via context menu or `Ctrl+B` / `⌘B` without disrupting running sessions; unrenamed forks are automatically prefixed with `[Fork] `.
-> - **Chat renaming (`Rename…` / `F2`) & grouped context menus**: durable custom chat titles (stored in `library.sqlite` with FTS5 sync and **Reset original**, without mutating transcript files) and horizontal dividers grouping context-menu actions.
-> - **Windows & OMP fixes**: strips Windows `\\?\` verbatim path prefixes, groups rotated OMP session chains, and blocks duplicate `omp` launches on already-held sessions.
-
-A curated project sidebar and unified agent history search for [Tern](https://stencil.so/tern).
-
-Bring order to your AI coding sessions across **OMP, Claude Code, Codex, Pi, OpenCode, and Cursor**.
-
-![tern-projects sidebar overview](docs/screenshots/showcase-overview.png)
+A customized fork of `tern-projects` for [Tern](https://stencil.so/tern), maintained at [Haku0002/tern-projects](https://github.com/Haku0002/tern-projects) (forked from `thegeneralist01/tern-projects` at `v0.2.3`).
 
 ---
 
-## Quickstart
+## Install & Update
 
-Run this inside Tern:
+Run inside Tern:
 
 ```sh
 tern plugin install github.com/Haku0002/tern-projects
 ```
 
-**Toggle the sidebar:**
-- **macOS:** `⌘ ⌥ S`
-- **Windows / Linux:** `Ctrl + Alt + S`
+To update to the latest commit:
 
-*(Or open **Projects** from the Tern command palette).*
-
-That's it. Tern fetches the plugin, and the background engine builds automatically on first load. No manual compile steps, no extra configuration.
-
-To update later:
 ```sh
 tern plugin install github.com/Haku0002/tern-projects --force
 ```
 
----
-
-## What it does
-
-If you use multiple AI coding agents, your sessions are scattered across hidden SQLite databases and JSONL files. `tern-projects` unifies them into a fast, native sidebar:
-
-- 📁 **Curated "My Projects" & Multi-Folder Workspaces** — Real projects rarely live in a single directory. Group an app, its backend API, shared libraries, and documentation into one named project with a custom icon.
-- 🎯 **Primary Launch Directories** — Pick one folder as **Primary** (where fresh agent sessions spawn), while additional directories are automatically supplied via `--add-dir` to harnesses that support multi-folder workspaces (OMP, Claude Code, Codex).
-- 🔍 **Instant Full-Text Search** — FTS5-powered search across all your past sessions. Filter by **Worktree**, **Repository**, or **All history** with live keyword highlighting.
-- 🚀 **Fresh Chat Launching** — Press `⌘N` (`Ctrl+N`) to launch a new chat in your preferred CLI (`omp`, `claude`, `codex`, `pi`, `opencode`, or `cursor`).
-- 📌 **Global Pins & Recents** — Keep critical threads pinned to the top of your sidebar. Recents keeps your 15 most recent chats one click away.
-- 🗄️ **Local Archiving & Safe Deletion** — Archive threads to hide them without losing data, or permanently delete sessions via verified native CLI calls.
-
-![tern-projects details, menus, and search results](docs/screenshots/showcase-details.png)
+The Rust indexer builds automatically on first load.
 
 ---
 
-## Keyboard-First Controls
+## Updates in This Fork
 
-Optimized for speed and one-handed navigation:
+### 1. Pinned Left Sidebar & Main-Pane Workspace
+- **Sidebar by default in new tabs**: opens at the left edge without stealing focus (configurable under **Settings → Sidebar → Open in new tabs**), enforces one sidebar per tab, and restores remembered width immediately using measured tab width (`sidebar.tab_cols`).
+- **Open in Main by default**: double-click, `Enter`, and the dock's **Resume** button open chats in the main pane beside the sidebar instead of spawning new tabs.
+- **Non-destructive pane swapping**: opening another chat in Main parks the running chat in Tern's deck so it continues executing in the background; reopening it swaps it back. Untouched shell prompts and already-exited panes close cleanly instead of accumulating in the deck.
+- **Explicit placement options**: every chat menu offers **Open in Main**, **Split Right**, **Split Down**, and **Open in New Tab**; project menus add **New chat in Split Right** and **New chat in Split Down**.
+- **Deduplication & lock safety**: already-open chats focus or unpark instead of launching duplicates, and opening an OMP chat held by an external `omp` process is safely blocked with a notice.
+
+### 2. Collapsible Sidebar (`Hide`, `Icon rail`, `Tile`)
+- Collapse and expand via the sidebar header button or `Ctrl + Alt + S` (`⌘ ⌥ S`).
+- Choose collapse behavior under **Settings → Sidebar → When collapsed**:
+  - **Hide**: parks the sidebar (at most one hidden sidebar in the deck; restored via shortcut or the status-bar **Projects** button).
+  - **Icon rail**: narrows to a vertical strip with Expand, Projects, Search, New chat, and Settings.
+  - **Tile**: floats as a compact card over the chat's top-left corner with **Expand Projects**, recent chats, **New chat**, and one-click idle parked cleanup.
+- Width, collapsed state, collapse mode, expanded project rows, and parked-section fold state persist in `tern.kv`.
+- **Selection card** toggle (**Settings → Sidebar → Selection card**) lets clicks select rows quietly without showing the bottom action card.
+
+### 3. Parked Pane Deck & Live Status
+- Foldable **Parked** section at the top of Projects lists parked panes with live state (`Working`, `Waiting`, `Exited`), inline **Close idle** (`×`), `Delete` key close, and right-click cleanup (**Close parked tile**, **Close idle parked**, **Close all parked…**) with confirmation when a working chat would be stopped.
+- Live status indicators (`●` open in tab, `◐` parked working, `○` parked idle) appear across Pinned, Projects, Recents, and Search, alongside **Park chat pane** / **Close chat pane** menu actions.
+- Command palette **Projects: Close Parked Panes…** and `Parked · N` status segment allow cleaning up parked tiles even while the sidebar is hidden.
+
+### 4. Safe Chat Forking & `[Fork] ` Prefixing
+- Fork **OMP**, **Claude Code**, and **Codex** chats directly from the context menu (**Fork chat**, **Fork in Split Right**, **Fork in Split Down**, **Fork in New Tab**) or keyboard (`Ctrl+B` / `⌘B`, `Ctrl+Shift+B` / `⇧⌘B`), including from chat-backed rows in **Parked**, without touching or interrupting the original session.
+- **Automatic `[Fork] ` title prefix**: unrenamed forked chats across OMP (`omp --fork`), Claude Code (`--fork-session` / `forkedFrom`), and Codex (`forked_from_id`) are automatically prefixed with `[Fork] ` (index schema v3) so forks cannot be mistaken for original sessions when deleting; renamed forks drop the prefix cleanly.
+- Live fork commands (`--fork`, `--fork-session`, `codex fork`) are excluded from parent-session matching and `omp` lock checks so they never hijack the original chat's live indicator or prevent opening the original chat.
+
+### 5. Grouped Context Menus & Durable Chat Rename (`Rename…` / `F2`)
+- **Grouped context menus**: native right-click menus and keyboard menus (`Shift+F10`) separate placement, forking, live-pane controls, title/organization, copy/options, and permanent deletion with horizontal dividers.
+- **Rename chat (`Rename…` / `F2`)**: rename any chat across all six harnesses (OMP, Claude Code, Codex, Pi, OpenCode, Cursor) from its context menu, Parked row, or `F2`.
+  - Custom titles are stored durably in `library.sqlite` (v2 schema, automatically migrated from v1) without modifying source transcript files or triggering OMP file-rotation locks.
+  - Full-text search (`sessions_fts`) stays synchronized with custom titles and persists across `index.sqlite` rebuilds; includes a **Reset original** button to revert to the indexed title.
+
+### 6. Windows & OMP Stability Fixes
+- Eliminates Windows `\\?\` verbatim path prefixes across indexed sessions, Git root resolution, folder browsing, and harness launches.
+- Collapses rotated OMP session chains (`continuationOf` and legacy pre-18.13 rotations) into a single entry while keeping `/new` sessions and forks separate, and deletes every file in a chain when permanently deleting an OMP chat.
+
+---
+
+## Keyboard Shortcuts
 
 | Action | macOS | Windows / Linux |
 |---|---|---|
-| **Toggle Projects sidebar** | `⌘ ⌥ S` | `Ctrl + Alt + S` |
+| **Toggle / collapse sidebar** | `⌘ ⌥ S` | `Ctrl + Alt + S` |
 | **Search everywhere** | `⌃ ⌥ ⌘ S` | `Ctrl + Alt + Shift + S` |
-| **Cycle views** (Projects ➔ Found ➔ Search ➔ Settings) | `Tab` / `Shift + Tab` | `Tab` / `Shift + Tab` |
-| **Quick Search** from Projects or Settings | `/` | `/` |
-| **New chat** (in current project/folder) | `⌘ N` | `Ctrl + N` |
-| **New chat with…** (choose harness) | `⇧ ⌘ N` | `Shift + Ctrl + N` |
-| **Open chat in the main area** (also double-click, or the dock's Resume) | `Enter` | `Enter` |
+| **Cycle views** (`Mine` / `Found` / `Search` / `Settings`) | `Tab` / `Shift + Tab` | `Tab` / `Shift + Tab` |
+| **Quick Search** | `/` | `/` |
+| **Open in Main** | `Enter` | `Enter` |
+| **Open in Split Right** | `⌘ Enter` | `Ctrl + Enter` |
+| **Open in New Tab** | `⇧ ⌘ Enter` | `Ctrl + Shift + Enter` |
 | **Fork chat / Fork in Split Right** | `⌘ B` / `⇧ ⌘ B` | `Ctrl + B` / `Ctrl + Shift + B` |
-| **Fold / unfold project** | `←` / `→` | `←` / `→` |
-| **Context menu / Actions** | `Shift + F10` | `Shift + F10` |
 | **Rename selected chat** | `F2` | `F2` |
+| **Close selected parked tile** | `Delete` | `Delete` |
+| **New chat / New chat with…** | `⌘ N` / `⇧ ⌘ N` | `Ctrl + N` / `Ctrl + Shift + N` |
+| **Fold / unfold project** | `←` / `→` | `←` / `→` |
+| **Keyboard context menu / options** | `Shift + F10` | `Shift + F10` |
 | **Copy resume command** | `⌃ Y` | `Ctrl + Y` |
-| **Dismiss / Clear search / Close modal** | `Esc` | `Esc` |
-
-Inside any text field, standard terminal editing shortcuts just work (`⌘A`/`Ctrl+A` select all, `⌘⌫`/`Ctrl+U` delete line prefix, `⌥⌫`/`Ctrl+⌫` delete word).
-
-### Opening chats
-
-Every new tab starts with the Projects sidebar on its left (turn this off under **Settings → Sidebar → Open in new tabs**). A tab holds at most one; `Ctrl + Alt + S` still toggles it. Clicking a chat or folder shows its card (Resume / New chat, Edit, …) at the bottom of the sidebar; **Settings → Sidebar → Selection card → Off** turns the card off, so a click only selects and the row's right-click menu offers the same actions. Opening a chat never adds a tab unless you ask for one:
-
-- **Open in Main** (default for double-click, `Enter` and Resume) shows the chat in the main area beside the sidebar. The chat it replaces is parked, not closed, so it keeps running; opening it again swaps it back.
-- **Split Right** / **Split Down** open it beside or below the current chat.
-- **Open in New Tab** opens it in a new tab.
-
-- **Fork chat** / **Fork in Split Right / Split Down / New Tab** (on OMP, Claude Code and Codex chats) branches a conversation into a brand-new session (`omp --fork <file>`, `claude --resume <id> --fork-session`, `codex fork <id>`) without touching or stopping the original — even while the original chat is actively running. Unrenamed forks automatically display a `[Fork] ` prefix in their title until renamed via `/rename`.
-A chat that is already open is focused (or swapped back in) instead of starting a second copy, and shows a live status dot (`●` open in a tab, `○` parked in the deck). Project menus offer **New chat in Split Right / Split Down** too; `Ctrl + Enter` (`⌘↵`) opens in Split Right and `Ctrl + Shift + Enter` (`⇧⌘↵`) opens in a new tab. Use **Rename…** (`F2`) in any chat's menu to give it a durable custom title (with **Reset original** to revert) without modifying source transcripts.
-
-When panes sit in Tern's parked-pane deck, a **Parked** section at the top of Projects lists them (foldable, with an inline `×` button to close all idle parked tiles at once): right-click any parked row — or any open/parked chat row anywhere in the sidebar — to **Close parked tile** / **Close chat pane** directly without opening it first (`Delete` also closes a selected parked tile, and **Projects: Close Parked Panes…** in the command palette or status bar works even while the sidebar is hidden). Working chats ask for confirmation before closing.
-The header's sidebar button collapses Projects; **Settings → Sidebar → When collapsed** picks how:
-
-- **Hide** (default) parks the sidebar, so it takes no width; its state survives and no chat is affected. `Ctrl + Alt + S`, or the **Projects** button the status line shows in tabs without a sidebar (when the status bar is on), brings it back at the left edge. While it is hidden, new tabs open without one.
-- **Icon rail** narrows it to a column of buttons: expand, Projects, Search, New chat and Settings. Tern keeps every split at least a tenth of its parent, so the rail can't get narrower than that.
-- **Tile** floats it as a card over the main chat's top-left corner: a large **Expand Projects** button, the three latest chats (they open in the main area as usual) and New chat. The chats behind it get the whole tab width. Expand, or `Ctrl + Alt + S`, docks it back at the left edge.
-
-A sidebar dealt back from Tern's parked-pane tiles also returns to the left edge. A sidebar that opens, returns or docks back appears at its remembered width right away. Width, collapsed state, collapse style and unfolded projects are remembered across restarts; a sidebar collapsed to a tile is still a tile after a restart.
+| **Refresh index** | `Ctrl + R` | `Ctrl + R` |
+| **Clear / dismiss** | `Esc` | `Esc` |
 
 ---
 
-## Supported Coding Harnesses
+## Supported Harnesses
 
-| Agent | Fresh Launch Command | Native Resume | Multi-Folder Support | Deletion Support |
-|---|---|---|---|---|
-| **OMP** | `omp --cwd <primary> [--add-dir <extra>...]` | `omp --resume <path>` | ✅ Multiple `--add-dir` | Transcript + artifact unlinking |
-| **Claude Code** | `claude [--add-dir <extra>...]` | `claude --resume <id>` | ✅ Multiple `--add-dir` | Exact session history filtering |
-| **Codex** | `codex --cd <primary> [--add-dir <extra>...]` | `codex resume <id>` | ✅ Multiple `--add-dir` | `codex delete <uuid> --force` |
-| **Pi** | `pi` | `pi --session <path>` | Single root | Exact file unlinking |
-| **OpenCode** | `opencode <primary>` | `opencode --session <id>` | Single root | `opencode session delete <id>` |
-| **Cursor** | `cursor-agent` / native CLI | Resumes in directory | Directory | Clean database record pruning |
-
----
-
-## How It Works
-
-- **Non-destructive**: Your original git worktrees, folders, and transcripts are never touched or rearranged.
-- **Fast SQLite FTS**: Full-text indexing runs in a separate local SQLite database (`index.sqlite`), refreshing in the background every two minutes.
-- **Durable Library**: Your custom projects, icons, pins, and preferences are stored in an independent `library.sqlite` so reindexing the cache never wipes your setup.
-
----
-
-## Contributing
-
-Contributions are welcome! Whether you are fixing a bug, improving Luau block performance, or adding support for a new AI coding assistant, see [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and step-by-step instructions.
-
----
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release notes.
-
----
+OMP, Claude Code, Codex, Pi, OpenCode, and Cursor. See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test instructions.
 
 ## License
 
-[MIT](LICENSE) © 2026 thegeneralist01
+[MIT](LICENSE)

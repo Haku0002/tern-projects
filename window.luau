@@ -8,6 +8,7 @@ end
 
 local fmt = require("./lib/fmt")
 local store = require("./lib/store")
+local resume = require("./lib/resume")
 local unpct = fmt.unpct
 
 local KIND = "tern-projects.panel"
@@ -18,6 +19,23 @@ local PLACES: { [string]: boolean } = { main = true, right = true, down = true, 
 type OpenRequest = { cwd: string, cmd: string, place: string, uid: string?, title: string?, sessions: { string }? }
 
 -- Per-pane state for toggle tracking.
+-- Look a pane up through `cx.session:pane` with `panes()` fallback for Tern 0.9.5 resilience.
+local function find_pane(cx: WindowCx, id: number?): PaneInfo?
+	if id == nil then
+		return nil
+	end
+	local direct = cx.session:pane(id)
+	if direct ~= nil then
+		return direct
+	end
+	for _, p in cx.session:panes() do
+		if p.pane == id then
+			return p
+		end
+	end
+	return nil
+end
+
 local last_mode: { [number]: string } = {}
 local prev_focus: { [number]: number } = {}
 -- Sidebars currently narrowed to the icon rail (tiled, but collapsed).
@@ -85,12 +103,12 @@ end
 -- The main-area pane of `tab`: its chat focused last, else its first tiled chat; nil when it has none.
 local function main_pane(cx: WindowCx, tab: number): number?
 	local last = main_of[tab]
-	if last ~= nil and tiled_chat(cx.session:pane(last), tab) then
+	if last ~= nil and tiled_chat(find_pane(cx, last), tab) then
 		return last
 	end
 	main_of[tab] = nil
 	for _, pane in leaves(cx, tab) do
-		if tiled_chat(cx.session:pane(pane), tab) then
+		if tiled_chat(find_pane(cx, pane), tab) then
 			return pane
 		end
 	end
@@ -180,7 +198,7 @@ local function open_pane(cx: WindowCx, uid: string, cwd: string): PaneInfo?
 	if entry == nil then
 		return nil
 	end
-	local info = if type(entry) == "table" and type(entry.pane) == "number" then cx.session:pane(entry.pane) else nil
+	local info = if type(entry) == "table" and type(entry.pane) == "number" then find_pane(cx, entry.pane) else nil
 	if info ~= nil and live_chat(info, entry, cwd) then
 		return info
 	end
@@ -221,7 +239,7 @@ local function reconcile(cx: WindowCx)
 	local changed = false
 	for uid, entry in map do
 		local pane = if type(entry) == "table" and type(entry.pane) == "number" then entry.pane else nil
-		local info = if pane ~= nil then cx.session:pane(pane) else nil
+		local info = if pane ~= nil then find_pane(cx, pane) else nil
 		if pane == nil or (info == nil and single) or (info ~= nil and not live_chat(info, entry, nil)) then
 			map[uid] = nil
 			changed = true
@@ -314,7 +332,7 @@ local function show_open(cx: WindowCx, info: PaneInfo, sidebar: number, main: nu
 	if place == "tab" then
 		return cx.layout:move_to_new_tab(pane, nil, { focus = true }) ~= nil
 	elseif place == "main" and main ~= nil then
-		local minfo = cx.session:pane(main)
+		local minfo = find_pane(cx, main)
 		if minfo ~= nil and disposable_pane(minfo, agent_map(cx)) then
 			if not cx.layout:move(pane, main, "right", { focus = true }) then
 				return false
@@ -345,7 +363,7 @@ local function launch(cx: WindowCx, req: OpenRequest, sidebar: number, main: num
 	end
 	-- Main replaces the visible chat in place. A blank untouched shell or exited pane closes cleanly; any
 	-- live chat or used shell is parked so its program keeps running in the deck.
-	local minfo = cx.session:pane(main)
+	local minfo = find_pane(cx, main)
 	local drop_main = minfo ~= nil and disposable_pane(minfo, agent_map(cx))
 	local pane = cx.layout:split(main, "right", spec, { focus = false })
 	if pane == nil then
@@ -366,7 +384,7 @@ end
 -- Places `sidebar`'s tab after showing or launching `pane` at `place`.
 local function finish_open(cx: WindowCx, sidebar: PaneInfo, main_before: number?, pane: number, place: string)
 	local tab = sidebar.tab :: number
-	if tiled_chat(cx.session:pane(pane), tab) then
+	if tiled_chat(find_pane(cx, pane), tab) then
 		main_of[tab] = pane
 	end
 	if main_before == nil and place ~= "tab" then
@@ -457,7 +475,7 @@ local function open_chat(cx: WindowCx, sidebar: PaneInfo, req: OpenRequest)
 			)
 			return
 		end
-		local side = later.session:pane(sidebar_pane)
+		local side = find_pane(later, sidebar_pane)
 		if side ~= nil and side.tab ~= nil then
 			open_session_in_layout(later, side, req)
 		end
@@ -473,7 +491,7 @@ local function dock_sidebar(cx: WindowCx, pane: number, tab: number): boolean
 	parked_from[pane] = nil
 	was_parked[pane] = nil
 	rail_panes[pane] = nil
-	local info = cx.session:pane(pane)
+	local info = find_pane(cx, pane)
 	if info == nil then
 		return false
 	end
@@ -637,7 +655,7 @@ end
 -- the deck so hidden sidebars never pile up), "tile" floats it as a card over the main chat's top-left corner.
 -- Either way the tab's chats take its width. A tab never empties: a sidebar alone in its tab stays.
 local function collapse_sidebar(cx: WindowCx, pane: number, style: string)
-	local info = cx.session:pane(pane)
+	local info = find_pane(cx, pane)
 	local tab = if info ~= nil then info.tab else nil
 	local main = if tab ~= nil then main_pane(cx, tab) else nil
 	if tab == nil or #leaves(cx, tab) < 2 or (style == "tile" and main == nil) then
@@ -679,7 +697,8 @@ local function collapse_sidebar(cx: WindowCx, pane: number, style: string)
 		cx.layout:focus(main)
 	end
 	sync_panels(cx)
-	if style == "hide" and not hint_shown and cx.settings:get("status_bar") ~= true then
+	local ok_sb, sb = pcall(function() return cx.settings:get("status_bar") end)
+	if style == "hide" and not hint_shown and not (ok_sb and sb == true) then
 		hint_shown = true
 		local keys = if tern.runtime.os == "macos" then "Cmd+Alt+S" else "Ctrl+Alt+S"
 		cx:toast("info", "Projects hidden", "Press " .. keys .. " to show it again, or turn on the status bar for a Projects button.")
@@ -691,7 +710,7 @@ end
 -- returning sidebar to its width: the rail's when `rail`, else the remembered one.
 local function size_sidebar(cx: WindowCx, pane: number, state: string, cols: number?, rail: boolean)
 	local style = store.collapse_style()
-	local info = cx.session:pane(pane)
+	local info = find_pane(cx, pane)
 	if info ~= nil and info.floating then
 		if state == "expand" and info.tab ~= nil then
 			dock_sidebar(cx, pane, info.tab)
@@ -749,7 +768,7 @@ end
 -- shortcut while the expanded sidebar is focused in `mode` collapses it by Settings instead of destroying it.
 local function toggle(cx: WindowCx, mode: string)
 	local f = cx.session:focused()
-	local fi = if f ~= nil then cx.session:pane(f) else nil
+	local fi = find_pane(cx, f)
 	local tab = if fi ~= nil then fi.tab else nil
 	if f == nil or fi == nil or tab == nil then
 		return
@@ -769,10 +788,9 @@ local function toggle(cx: WindowCx, mode: string)
 	end
 
 	local edge = leaves(cx, tab)[1] or f
-	local pinfo = if panel ~= nil then cx.session:pane(panel) else nil
+	local pinfo = find_pane(cx, panel)
 	local was_collapsed = false
 	if panel ~= nil and pinfo ~= nil and pinfo.floating then
-		was_collapsed = true
 		dock_sidebar(cx, panel, tab)
 	elseif panel == nil and parked ~= nil and dock_sidebar(cx, parked, tab) then
 		was_collapsed = true
@@ -787,7 +805,7 @@ local function toggle(cx: WindowCx, mode: string)
 			if #leaves(cx, tab) >= 2 then
 				size_sidebar(cx, panel, "collapse", nil, false)
 				local pf = prev_focus[panel]
-				if pf ~= nil and pf ~= panel and cx.session:pane(pf) ~= nil then
+				if pf ~= nil and pf ~= panel and find_pane(cx, pf) ~= nil then
 					cx.layout:focus(pf)
 				end
 			end
@@ -810,6 +828,10 @@ local function toggle(cx: WindowCx, mode: string)
 	end
 
 	local new_pane = cx.layout:split(edge, "left", { block = KIND, args = { mode, fi.cwd or "" } })
+	if new_pane == nil then
+		-- Tern 0.9.5 can return nil from split for some live pane ids; open beside the focused pane instead.
+		new_pane = cx:new_block(KIND, { mode, fi.cwd or "" }, "split")
+	end
 	if new_pane == nil then
 		cx:toast("error", "Projects block unavailable", "tern plugin list")
 		return
@@ -834,7 +856,7 @@ local function auto_sidebar(cx: WindowCx, tab: number)
 		end
 	end
 	local edge = leaves(cx, tab)[1]
-	local info = if edge ~= nil then cx.session:pane(edge) else nil
+	local info = if edge ~= nil then find_pane(cx, edge) else nil
 	if edge == nil or info == nil then
 		return
 	end
@@ -890,7 +912,7 @@ local function handle_pane_route(cx: WindowCx, sidebar: PaneInfo, query: string)
 	end
 	local raw_pane = param(query, "pane") or ""
 	local pane_id = if string.match(raw_pane, "^%d+$") then tonumber(raw_pane) else nil
-	local target = if pane_id ~= nil then cx.session:pane(pane_id) else nil
+	local target = if pane_id ~= nil then find_pane(cx, pane_id) else nil
 	if target == nil or target.block == KIND then
 		return
 	end
@@ -987,7 +1009,7 @@ local function pick_parked_to_close(cx: WindowCx)
 				later:toast("success", "Closed " .. fmt.plural(closed, "parked pane"), if kept > 0 then "Kept " .. fmt.plural(kept, "working chat") .. " alive." else nil)
 			end
 		elseif choice.op == "one" and type(choice.pane) == "number" then
-			local info = later.session:pane(choice.pane)
+			local info = find_pane(later, choice.pane)
 			if info ~= nil and info.block ~= KIND then
 				later.layout:close(choice.pane)
 				sync_panels(later)
@@ -1076,7 +1098,7 @@ tern.command({
 
 -- The chat focused last in a tab is where Open in Main and the splits go.
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
-	if tiled_chat(cx.session:pane(ev.pane), ev.tab) then
+	if tiled_chat(find_pane(cx, ev.pane), ev.tab) then
 		main_of[ev.tab] = ev.pane
 	end
 	sync_panels(cx)
@@ -1085,7 +1107,7 @@ end)
 -- Dragging a floating Tile sidebar into a split docks it back at the left edge at its remembered width.
 tern.on("float_moved", function(ev: FloatMovedEvent, cx: WindowCx)
 	if ev.docked ~= nil then
-		local p = cx.session:pane(ev.pane)
+		local p = find_pane(cx, ev.pane)
 		if p ~= nil and p.block == KIND then
 			dock_sidebar(cx, ev.pane, ev.tab)
 		end
@@ -1125,7 +1147,7 @@ tern.on("tab_closed", function(ev: TabEvent, cx: WindowCx)
 	for pane, tab in parked_from do
 		if tab == ev.tab then
 			parked_from[pane] = nil
-			local info = cx.session:pane(pane)
+			local info = find_pane(cx, pane)
 			if info ~= nil and info.block == KIND and info.parked then
 				cx.layout:close(pane)
 			end
@@ -1152,7 +1174,7 @@ tern.on("tab_created", function(ev: TabEvent, cx: WindowCx)
 end)
 
 tern.on("pane_created", function(ev: PaneEvent, cx: WindowCx)
-	local info = cx.session:pane(ev.pane)
+	local info = find_pane(cx, ev.pane)
 	local tab = if info ~= nil then info.tab else nil
 	if tab ~= nil and new_tabs[tab] then
 		new_tabs[tab] = nil
@@ -1182,12 +1204,36 @@ tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
 end)
 
 
+local function publish_shortcuts(cx: WindowCx, pane: number)
+	local ok, keymap = pcall(function() return cx.actions:keys() end)
+	local bindings: { [string]: { string } } = { projects = {}, search = {}, settings = {} }
+	if ok then
+		for chord, actions in keymap do
+			for _, id in actions do
+				local name = string.match(id, "^plugin%.tern%-projects%.([a-z]+)$")
+				if name and bindings[name] then
+					table.insert(bindings[name], chord)
+				end
+			end
+		end
+		for _, chords in bindings do
+			table.sort(chords)
+		end
+	end
+	send_panel(cx, pane, {
+		ev = "action",
+		id = "main",
+		act = "shortcut-state",
+		value = tern.json.encode(if ok then { bindings = bindings } else { error = tostring(keymap) }),
+	})
+end
+
 -- Panel-generated requests carry a shared capability token (`sidebar.auth`) and name their `src` panel pane,
 -- so right-clicking or clicking buttons in an unfocused sidebar works while links in terminal/chat output can
 -- never forge a launch, close or resize.
 tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	local route, q = string.match(link.url, "^tern%-projects://([a-z]+)%?(.*)$")
-	if route ~= "resume" and route ~= "launch" and route ~= "sidebar" and route ~= "pane" then return nil end
+	if route ~= "resume" and route ~= "launch" and route ~= "sidebar" and route ~= "pane" and route ~= "shortcuts" and route ~= "keyboard" and route ~= "keyconfig" then return nil end
 	local query = q :: string
 	local expected = store.get(store.AUTH_KEY)
 	if type(expected) ~= "string" or expected == "" or param(query, "tok") ~= expected then
@@ -1198,8 +1244,19 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 		src = tonumber(param(query, "pane") or "")
 	end
 	local from = src or link.pane
-	local origin = if from ~= nil then cx.session:pane(from) else nil
+	local origin = find_pane(cx, from)
 	if origin == nil or origin.block ~= KIND or origin.tab == nil then
+		return { handled = true }
+	end
+	if route == "shortcuts" or route == "keyboard" or route == "keyconfig" then
+		if route == "shortcuts" then
+			publish_shortcuts(cx, origin.pane)
+		elseif route == "keyconfig" then
+			cx:command("open_config")
+		else
+			cx:command("preferences")
+			cx:toast("info", "Customize Projects shortcuts", "Choose Keyboard and search for Projects.")
+		end
 		return { handled = true }
 	end
 	if route == "sidebar" then
@@ -1245,6 +1302,10 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 			table.insert(list, id)
 		end
 		sessions = if #list > 0 then list else nil
+	end
+	if route == "resume" then
+		local ok_ag, agents = pcall(function() return cx.settings:get("agents") end)
+		cmd = resume.command(cmd, (if ok_ag and type(agents) == "table" then agents else {}) :: any)
 	end
 	open_chat(cx, origin, { cwd = cwd, cmd = cmd, place = place, uid = uid, title = title, sessions = sessions })
 	return { handled = true }

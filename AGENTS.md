@@ -21,6 +21,7 @@ lib/cli.luau         Binary discovery, CLI invocation, JSON decoding
 lib/fmt.luau         Formatting helpers: dates, agent labels/icons, URL encoding, snippets
 lib/input.luau       Keyboard shortcuts and native UTF-16 edit handling
 lib/picker.luau      Modal picker component for selection sheets
+lib/resume.luau      Window-side ACP resume command selection using Tern ACP preferences
 lib/store.luau       `tern.kv` keys and helpers shared by the panel and window (sidebar width/collapsed/collapse style/measured tab width/auto tabs/expansion, open chats)
 lib/project-editor.luau  Unsaved project draft state and child directory browser
 lib/textfield.luau   UTF-8 text field component
@@ -38,6 +39,7 @@ indexer/             Rust backend (`tern-projects` CLI binary)
   src/adapters/      Session adapters for harnesses (claude, codex, omp, pi, opencode, cursor)
   tests/             Real-binary integration test suites with isolated environments
 scripts/build.sh     Build helper: compiles release binary to bin/
+scripts/check-luau.py Compile runtime Luau sources and enforce `--!strict` headers
 bin/tern-projects    Compiled binary (gitignored)
 tern.d.luau          Generated Tern type stubs (gitignored)
 ```
@@ -86,7 +88,7 @@ tern plugin reload                               # Reload plugin in running Tern
 
 - **Durable Library vs. Disposable Index**:
   - `index.sqlite` is a rebuildable cache of history transcripts. Schema version bumps force a reindex.
-  - `library.sqlite` stores durable user configurations (curated projects, folder associations, custom pins, chat assignments, global settings). Never drop or clear `library.sqlite` during index rebuilds.
+  - `library.sqlite` stores durable user configurations (curated projects, folder associations, retained `project_chats`, `ignored_sources`, custom pins, chat assignments, global settings; schema v4). Never drop or clear `library.sqlite` during index rebuilds.
 - **Automatic Compilation**:
   - `lib/backend.luau` automatically compiles the Rust binary with Cargo when the plugin loads and caches the binary inside `<plugin.data>/backend/`. Requests queue until compilation finishes.
 - **Fail-Closed Deletion Safety**:
@@ -97,8 +99,8 @@ tern plugin reload                               # Reload plugin in running Tern
 - **Launch and Resume Contracts**:
   - Fresh chats launch with the primary project directory as `cwd`. Any additional folders are passed via harness-supported CLI flags (e.g. `--add-dir`), or a warning is surfaced before launching primary-only.
   - Command generation must be safely quoted per OS (`shell_join` on Unix, Base64-encoded command blocks on Windows).
-  - Panel → window URLs: `tern-projects://resume?...`, `tern-projects://launch?...`, `tern-projects://pane?op=<show|park|close|close-idle-parked|close-all-parked>[&pane=<id>][&place=<…>]` and `tern-projects://sidebar?state=<collapse|expand|fit|sync>&pane=<id>[&cols=<n>][&rail=1]`. Every panel URL carries `&src=<panel_pane>&tok=<sidebar.auth>` (a capability token written by the panel VM to `tern.kv`), verified by `window.luau` along with checking that `src` is a live `tern-projects.panel` in a tab of this window; this allows unfocused right-click actions while preventing terminal/chat links from spoofing routes. `main` parks live chats (closing only already-exited panes or untouched OSC-133 shell prompts) and launches beside them; `right`/`down` split the main pane; `tab` is the only path that opens a new tab.
-  - Live pane sync: `window.luau` inspects `cx.session:panes()` and `cx.agents:list()` (`tern.json.null`-safe) and pushes deduplicated `live-panes` events (`open`, `sessions`, `parked`, and the tab's active main-chat `cwd`) to each open panel; `float_moved` docks a dragged floating tile back to the left edge at its remembered width.
+  - Panel → window URLs: `tern-projects://resume?...`, `tern-projects://launch?...`, `tern-projects://pane?op=<show|park|close|close-idle-parked|close-all-parked>[&pane=<id>][&place=<…>]`, `tern-projects://sidebar?state=<collapse|expand|fit|sync>&pane=<id>[&cols=<n>][&rail=1]`, and `tern-projects://shortcuts?` / `keyboard?` / `keyconfig?`. Every panel URL carries `&src=<panel_pane>&tok=<sidebar.auth>` (a capability token written by the panel VM to `tern.kv`), verified by `window.luau` along with checking that `src` is a live `tern-projects.panel` (via `find_pane`, falling back to `cx.session:panes()` when `cx.session:pane` returns nil in Tern 0.9.5) in a tab of this window; this allows unfocused right-click actions while preventing terminal/chat links from spoofing routes. `main` parks live chats (closing only already-exited panes or untouched OSC-133 shell prompts) and launches beside them; `right`/`down` split the main pane; `tab` is the only path that opens a new tab. `resume` applies `lib/resume.luau` at the window boundary using current `agents` preferences (`auto_acp`, `keep_tui`) while keeping panel copy commands plain.
+  - Live pane sync: `window.luau` inspects `cx.session:panes()` and `cx.agents:list()` (`tern.json.null`-safe) and pushes deduplicated `live-panes` events (`open`, `sessions`, `parked`, and the tab's active main-chat `cwd`) to each open panel; `float_moved` docks a dragged floating tile back to the left edge at its remembered width. Optional `cx.settings:get(...)` reads (such as `status_bar`) are wrapped in `pcall` so older or differing Tern versions never fail the route.
   - Width snapping: the window API can't read pane sizes, so once a fit settles within 2 cells of the remembered width the panel stores `cols / share` as `sidebar.tab_cols`. The window computes a sidebar's share from `cx.session:layout(tab)` (product of right-split ratios on its path) and resizes it to the remembered width in the same handler that docks it, so no frame shows it at Tern's default half split.
   - OMP chains: omp moves a live session to a new file (new id, history copied) when another omp process holds it, and keeps the old file. `adapters/omp.rs` groups such files per folder (`continuationOf`; older omp: `parentSession` + inherited `providerPromptCacheKey` + the same first entry) and lists each chain once, as its newest file, with uid `omp:<first session id>` and `resume.sessions` = every id in the chain. `db::upsert_session` keeps one row per source, so a file that joins a chain drops its old row. Resume URLs carry `&sessions=<ids>`; the window refuses to start omp when a running omp process's command line names one of them (`cx.procs`), unless the chat is already open in a tracked pane (then it is shown). Deletion (`delete_files.rs`) removes every file of the chain and its `history.db` rows.
 - **Paths**: Stored and emitted paths never use the Windows verbatim prefix (`\\?\`). The backend normalizes them before writing `library.sqlite`/`index.sqlite` or emitting JSON; Luau compares directories case- and separator-insensitively on Windows.

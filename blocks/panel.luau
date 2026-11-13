@@ -77,11 +77,18 @@ local function known_chat_for_pane(s: any, pane: any): any
 	end
 	return nil
 end
+local cancel_flow: (any) -> ()
 local function pane_alive(id: number): boolean
 	for _, p in tern.pane.list() do if p.pane == id then return true end end
 	return false
 end
-local function live(s: any): boolean return s.alive and pane_alive(s.cx.pane) end
+local function live(s: any): boolean
+	if not s.alive then return false end
+	if pane_alive(s.cx.pane) then return true end
+	s.alive = false
+	cancel_flow(s)
+	return false
+end
 local function toast(s: any, level: any, text: string, sub: string?) s.cx:toast(level, text, sub) end
 local function project_key(s: any, p: any): string return if s.view == "mine" then "project:" .. tostring(p.id) else "discovered:" .. tostring(p.root) end
 local function project_name(p: any): string return p.name or p.label or fmt.basename(p.root or "") end
@@ -193,15 +200,81 @@ end
 
 local reload: (any) -> ()
 local action: (any, string, string?) -> ()
-local function cancel_flow(s: any)
+local end_launch_wait: (any) -> ()
+local LAUNCH_TIMEOUT = {["launch-plan"] = 15000, harnesses = 65000}
+end_launch_wait = function(s: any)
+	for _, timer in s.launch_timers or {} do pcall(function() timer:cancel() end) end
+	s.launch_timers = nil
+	s.launch_wait_seq = (s.launch_wait_seq or 0) + 1
+	s.launch_pending = false
+	s.launch_slow = false
+	s.launch_phase = nil
+	local p = s.launch_picker
+	if p and p.subtitle_backup then p.subtitle = p.subtitle_backup; p.subtitle_backup = nil end
+	s.launch_picker = nil
+end
+cancel_flow = function(s: any)
 	s.flow = (s.flow or 0) + 1
 	s.picker = nil; s.menu = nil; s.confirm = nil; s.rename = nil; s.pending_plan = nil; s.launch_place = nil
+	end_launch_wait(s)
+end
+local function wait_text(s: any, in_picker: boolean): string
+	if s.launch_slow then return "Still preparing. You can cancel and retry." end
+	if not in_picker then return "Preparing new chat…" end
+	return if s.launch_phase == "harnesses" then "Checking installed tools…" else "Preparing launch…"
+end
+local function launch_timeout_text(): string
+	return if cli.status() then "The backend is still building. Retry when the build finishes." else "Preparing new chat timed out. Retry or choose another tool."
+end
+local function begin_launch_wait(s: any, phase: string)
+	end_launch_wait(s)
+	local seq = s.launch_wait_seq
+	s.launch_pending = true
+	s.launch_slow = false
+	s.launch_phase = phase
+	s.error = nil; s.error_reload = false
+	if s.picker then
+		s.launch_picker = s.picker
+		s.picker.subtitle_backup = s.picker.subtitle
+		s.picker.subtitle = wait_text(s, true)
+	end
+	local function current(): boolean return live(s) and s.launch_pending and s.launch_wait_seq == seq end
+	s.launch_timers = {
+		tern.timer(5000, function()
+			if not current() then return end
+			s.launch_slow = true
+			if s.picker then s.picker.subtitle = wait_text(s, true) end
+			s.cx:render()
+		end),
+		tern.timer(LAUNCH_TIMEOUT[phase], function()
+			if not current() then return end
+			local p = s.picker
+			local text = launch_timeout_text()
+			local saved_place = s.launch_place
+			cancel_flow(s)
+			s.launch_place = saved_place
+			if p then
+				p.state = if p.data and p.data.verified then "ready" else "error"
+				p.message = text
+				if p.state == "error" then
+					p.actions = {{id = "close", label = "Cancel", keys = {"esc"}}, {id = "retry-harnesses", label = "Retry", keys = {"ctrl+r"}, primary = true}}
+				end
+				s.picker = p; picker.settle(p)
+			else s.error = text; s.error_reload = false end
+			toast(s, "error", "Couldn't prepare new chat", text)
+			s.cx:render()
+		end),
+	}
+	s.cx:render()
 end
 local function request(s: any, payload: any, cb: (any) -> (), channel: string?, on_err: ((string) -> ())?)
 	local key = channel or "request"
 	s.tokens[key] = (s.tokens[key] or 0) + 1
 	local token = s.tokens[key]
 	local mode, flow = s.mode, s.flow or 0
+	local function current(): boolean
+		return live(s) and s.tokens[key] == token and s.mode == mode and (s.flow or 0) == flow
+	end
 	cli.request(payload, function(data, err)
 		if not live(s) or s.tokens[key] ~= token then return end
 		if key ~= "mutation" and (s.mode ~= mode or (s.flow or 0) ~= flow) then s.cx:render(); return end
@@ -210,12 +283,12 @@ local function request(s: any, payload: any, cb: (any) -> (), channel: string?, 
 			if on_err then on_err(err) else s.error = err; s.error_reload = false end
 		else cb(data) end
 		s.cx:render()
-	end)
+	end, if key == "launch" or key == "harnesses" then current else nil)
 end
 local function mutate(s: any, payload: any, done: ((any) -> ())?, on_err: ((string) -> ())?)
 	if s.busy then return end
 	local conf, p, ren = s.confirm, s.picker, s.rename
-	local verb = if payload.op == "delete" then "Deleting…" elseif payload.op == "project-remove" then "Removing…" elseif payload.assignment then "Moving…" elseif payload.archived == false then "Restoring…" elseif payload.title ~= nil then "Renaming…" else "Saving…"
+	local verb = if payload.op == "delete" then "Deleting…" elseif payload.op == "project-remove" then "Removing…" elseif payload.op == "source-ignore" then "Ignoring…" elseif payload.op == "source-unignore" then "Unignoring…" elseif payload.assignment then "Moving…" elseif payload.archived == false then "Restoring…" elseif payload.title ~= nil then "Renaming…" else "Saving…"
 	s.busy = true; s.busy_label = verb
 	if conf then conf.error = nil end
 	if p then p.message = nil; p.busy_label = verb end
@@ -243,7 +316,7 @@ reload = function(s: any)
 		if err then s.error = err; s.error_reload = true else
 			s.error = nil; s.loaded = true
 			if s.mode == "search" then s.results = data.sessions or {}; s.total = data.total or 0
-			else s.projects = data.projects or {}; s.pinned = data.pinned or {}; s.recent = data.recent or {}; s.settings = data.settings or s.settings end
+			else s.projects = data.projects or {}; s.pinned = data.pinned or {}; s.recent = data.recent or {}; s.settings = data.settings or s.settings; s.ignored_sources = data.ignored_sources or s.ignored_sources end
 			rebuild(s)
 			if s.search_edge and s.mode == "search" then
 				s.sel = s.order[if s.search_edge == "last" then #s.order else 1]
@@ -257,6 +330,7 @@ reload = function(s: any)
 		cli.request({op = "snapshot", view = "mine", per = 0, recent = 0}, function(data, err)
 			if not live(s) or s.gen ~= gen or err or not data then return end
 			s.settings = data.settings or s.settings
+			s.ignored_sources = data.ignored_sources or s.ignored_sources
 			s.project_list = data.projects or {}
 			if s.project_id then
 				local found = false
@@ -510,7 +584,7 @@ local function browser_query(s: any)
 		if live(s) and s.editor == d and d.browser == b and b.gen == gen then browse(s, dir, {filter = base}) end
 	end)
 end
-local launch_plan: (any, string) -> ()
+local launch_plan: (any, string, boolean) -> ()
 local harness_picker: (any, string) -> ()
 local start_launch: (any, boolean) -> ()
 local function browser_intent(s: any, intent: string?, value: string?)
@@ -562,18 +636,19 @@ local function editor_intent(s: any, intent: string?, value: string?)
 			if not live(s) then return end
 			s.busy = false; s.busy_label = nil
 			if s.editor ~= d then
-				if err then toast(s, "error", "Couldn't save project", fmt.error(err)) else toast(s, "success", "Saved " .. d.name.text) end
+				if err then toast(s, "error", "Couldn't save project", fmt.error(err))
+				else toast(s, "success", "Saved " .. d.name.text, if data and data.project and data.project.hidden then "Hidden by ignored source folders. Unignore in Settings → Ignored source folders." else nil) end
 				reload(s); return
 			end
 			if err then d.error = fmt.error(err) else
 				s.editor = nil; s.view = "mine"; s.mode = "projects"
 				local p = data and data.project
-				if p then local key = "project:" .. tostring(p.id); s.sel = key; set_expanded(s, key, true) end
-				toast(s, "success", if d.id then "Saved " .. d.name.text else "Created " .. d.name.text)
+				if p and not p.hidden then local key = "project:" .. tostring(p.id); s.sel = key; set_expanded(s, key, true) else s.sel = nil end
+				toast(s, "success", if d.id then "Saved " .. d.name.text else "Created " .. d.name.text,
+					if p and p.hidden then "Hidden by ignored source folders. Unignore in Settings → Ignored source folders." else nil)
 				s.cx:frame({{"focus", NULL}})
 				reload(s)
 			end
-			s.cx:render()
 		end)
 		return
 	end
@@ -585,7 +660,9 @@ end
 -- Pickers --------------------------------------------------------------------------------
 
 local function open_picker(s: any, spec: any)
-	s.menu = nil; s.confirm = nil
+	local saved_place = s.launch_place
+	cancel_flow(s)
+	s.launch_place = saved_place
 	s.picker = picker.new(spec)
 	if s.collapsed then request_sidebar(s, "expand") end
 	s.cx:frame({{"focus", NULL}})
@@ -646,7 +723,7 @@ harness_picker = function(s: any, purpose: string)
 	if is_default then table.insert(seeds, {id = "ask", label = "Ask every time", icon = "help", disabled = true}) end
 	for _, id in {"omp", "claude", "codex", "pi", "opencode", "cursor"} do table.insert(seeds, {id = id, label = fmt.agent_label(id), icon = fmt.agent_icon(id), disabled = true}) end
 	local actions = {{id = "close", label = "Cancel", keys = {"esc"}}, {id = "choose", label = if is_default then "Use as default" else "Start chat", keys = {"enter"}, primary = true}}
-	if not is_default then table.insert(actions, {id = "choose-default", label = "Start & set default", keys = {if tern.runtime.os == "macos" then "cmd+enter" else "ctrl+enter"}, ["end"] = true}) end
+	if not is_default then table.insert(actions, {id = "choose-default", label = "Start & set default", keys = {if tern.runtime.os == "macos" then "cmd+enter" else "ctrl+enter"}, disabled = true, ["end"] = true}) end
 	open_picker(s, {
 		kind = if is_default then "default-harness" else "harness",
 		title = if is_default then "Default harness" else "New chat",
@@ -658,15 +735,20 @@ harness_picker = function(s: any, purpose: string)
 		items = seeds,
 		current = if is_default then {if type(default) == "string" then default else "ask"} else {},
 		actions = actions,
+		data = {purpose = purpose, verified = false},
 	})
 	local p = s.picker
 	if not is_default and s.default_unavailable then p.subtitle = s.default_unavailable end
+	if not is_default then begin_launch_wait(s, "harnesses") end
 	request(s, {op = "harnesses"}, function(data)
 		if s.picker ~= p then return end
+		end_launch_wait(s)
 		local items = {}
+		local installed = false
 		if is_default then table.insert(items, {id = "ask", label = "Ask every time", detail = "Choose a harness for each new chat", icon = "help"}) end
 		local folders = s.launch_target and s.launch_target.folders or 1
 		for _, h in data.harnesses or {} do
+			if h.installed then installed = true end
 			local badges = {}
 			if h.id == default then table.insert(badges, {text = "Default", tone = "accent"}) end
 			local capability = if h.multi_root then fmt.plural(folders, "folder") else "Primary folder only"
@@ -681,10 +763,24 @@ harness_picker = function(s: any, purpose: string)
 				badges = badges,
 			})
 		end
-		p.items = items; p.state = "ready"
-		p.selected = if is_default then (if type(default) == "string" then default else "ask") elseif type(default) == "string" then default else nil
+		p.items = items; p.state = "ready"; p.data.verified = true
+		for _, a in p.actions do if a.id == "choose-default" then a.disabled = not installed end end
+		if is_default then
+			p.selected = if type(default) == "string" then default else "ask"
+		else
+			p.selected = nil
+			if type(default) == "string" then
+				for _, it in items do if it.id == default and not it.disabled then p.selected = default end end
+			end
+		end
 		picker.settle(p)
-	end, "harnesses", function(err) if s.picker == p then p.state = "error"; p.message = fmt.error(err) end end)
+	end, "harnesses", function(err)
+		if s.picker == p then
+			end_launch_wait(s)
+			p.state = "error"; p.message = fmt.error(err)
+			p.actions = {{id = "close", label = "Cancel", keys = {"esc"}}, {id = "retry-harnesses", label = "Retry", keys = {"ctrl+r"}, primary = true}}
+		end
+	end)
 end
 local function load_archived_page(s: any, p: any, offset: number)
 	p.state = "loading"
@@ -712,6 +808,32 @@ local function archived_picker(s: any)
 		actions = {{id = "close", label = "Close", keys = {"esc"}}, {id = "archived-prev", label = "Previous", keys = {"ctrl+p"}, disabled = true}, {id = "archived-next", label = "Next", keys = {"ctrl+n"}, disabled = true}, {id = "archived-delete", label = "Delete permanently…", keys = {if tern.runtime.os == "macos" then "cmd+backspace" else "ctrl+backspace"}, danger = true, ["end"] = true}, {id = "archived-restore", label = "Restore", keys = {"enter"}, primary = true}}})
 	load_archived_page(s, s.picker, 0)
 end
+local function set_ignored_items(s: any, p: any, list: {any})
+	s.ignored_sources = list
+	local items = {}
+	for _, rule in list do
+		table.insert(items, {id = rule.path, label = rule.path, title = rule.path, mono = true, icon = "folder", detail = "Includes subfolders and worktrees"})
+	end
+	p.items = items; p.state = "ready"; p.message = nil
+	picker.settle(p)
+end
+local function load_ignored(s: any, p: any)
+	p.state = "loading"; p.message = nil
+	for _, a in p.actions do if a.id == "ignored-retry" then a.disabled = true end end
+	request(s, {op = "source-ignores"}, function(data)
+		if s.picker == p then set_ignored_items(s, p, data.ignored_sources or {}) end
+	end, "ignored", function(err)
+		if s.picker ~= p then return end
+		p.state = "error"; p.message = fmt.error(err)
+		for _, a in p.actions do if a.id == "ignored-retry" then a.disabled = false end end
+	end)
+end
+local function ignored_picker(s: any)
+	open_picker(s, {kind = "ignored", title = "Ignored source folders", subtitle = "Each rule hides a folder and its subfolders. Rules are independent: unignoring a folder keeps it hidden while a parent folder stays ignored.",
+		icon = "slash-circle", noun = "ignored folders", search = true, placeholder = "Filter folders", state = "loading", items = {}, empty = "No ignored source folders. Use Ignore source folder… on a Discovered folder.",
+		actions = {{id = "close", label = "Close", keys = {"esc"}}, {id = "ignored-retry", label = "Retry", keys = {"ctrl+r"}, disabled = true}, {id = "unignore", label = "Unignore", keys = {"enter"}, primary = true}}})
+	load_ignored(s, s.picker)
+end
 
 -- Launching ------------------------------------------------------------------------------
 
@@ -721,13 +843,15 @@ local function launch_route(s: any, plan: any)
 	open_window_url(s, "tern-projects://launch?cwd=" .. fmt.pct(plan.cwd) .. "&cmd=" .. fmt.pct(plan.command) .. "&place=" .. (s.launch_place or "main"))
 	toast(s, "info", "Starting " .. fmt.agent_label(s.launch_harness or ""), "In " .. fmt.path(plan.cwd))
 end
-launch_plan = function(s: any, harness: string)
+launch_plan = function(s: any, harness: string, from_default: boolean)
 	local target = s.launch_target
 	if not target then return end
 	s.launch_harness = harness
+	begin_launch_wait(s, "launch-plan")
 	if s.picker then s.picker.state = "loading"; s.picker.message = "Preparing launch…" end
 	local payload = {op = "launch-plan", harness = harness, project_id = target.project_id, cwd = target.cwd}
 	request(s, payload, function(plan)
+		end_launch_wait(s)
 		if #(plan.warnings or {}) == 0 then launch_route(s, plan); return end
 		s.pending_plan = plan
 		s.picker = nil
@@ -771,13 +895,19 @@ launch_plan = function(s: any, harness: string)
 			buttons = {{id = "cancel", label = "Cancel"}, {id = "launch-accept", label = "Start in " .. fmt.basename(plan.cwd), variant = "primary"}}, focus = 2, data = plan}
 		if s.collapsed then request_sidebar(s, "expand") end
 	end, "launch", function(err)
+		end_launch_wait(s)
+		local message = fmt.error(err)
 		if target.project_id and string.find(err, "Primary source folder is missing or unreadable", 1, true) then
 			s.picker = nil
-			s.confirm = {kind = "missing-primary", title = "Primary folder is unavailable", body = {c.note(fmt.error(err)), c.note("Edit the project to choose another primary source folder.")},
+			s.confirm = {kind = "missing-primary", title = "Primary folder is unavailable", body = {c.note(message), c.note("Edit the project to choose another primary source folder.")},
 				buttons = {{id = "cancel", label = "Cancel"}, {id = "edit-launch-project", label = "Edit project…", variant = "primary"}}, focus = 1, data = target}
 			if s.collapsed then request_sidebar(s, "expand") end
-		elseif s.picker then s.picker.state = "ready"; s.picker.message = fmt.error(err); toast(s, "error", "Couldn't prepare new chat", fmt.error(err))
-		else s.error = err; s.error_reload = false end
+		elseif from_default and (string.find(err, " CLI is not installed", 1, true) or string.find(err, " is unavailable:", 1, true)) then
+			s.default_unavailable = fmt.agent_label(harness) .. " isn't available. " .. message
+			toast(s, "error", "Couldn't prepare new chat", message)
+			harness_picker(s, "launch")
+		elseif s.picker then s.picker.state = "ready"; s.picker.message = message; toast(s, "error", "Couldn't prepare new chat", message)
+		else s.error = err; s.error_reload = false; toast(s, "error", "Couldn't prepare new chat", message) end
 	end)
 end
 local function launch_target_for(s: any, key: string?): boolean
@@ -797,21 +927,14 @@ end
 start_launch = function(s: any, choose: boolean)
 	local default = s.settings.default_harness
 	s.default_unavailable = nil
+	-- An installed default needs one launch plan, not the whole tool survey.
 	if choose or type(default) ~= "string" then harness_picker(s, "launch"); return end
-	request(s, {op = "harnesses"}, function(data)
-		for _, h in data.harnesses or {} do
-			if h.id == default then
-				if h.installed then launch_plan(s, default); return end
-				s.default_unavailable = fmt.agent_label(default) .. " isn't available. " .. (if type(h.reason) == "string" then h.reason else "Choose another harness.")
-			end
-		end
-		s.default_unavailable = s.default_unavailable or (fmt.agent_label(default) .. " isn't available. Choose another harness.")
-		harness_picker(s, "launch")
-	end, "harnesses")
+	launch_plan(s, default, true)
 end
 -- `place` is where the window opens the chat (main | right | down | tab). It carries through the harness
 -- picker, the folder browser and the launch confirmation; any other flow resets it.
 local function new_chat(s: any, key: string?, choose: boolean, place: string)
+	if s.launch_pending then return end
 	cancel_flow(s)
 	s.launch_place = place
 	if not launch_target_for(s, key) then
@@ -822,6 +945,7 @@ local function new_chat(s: any, key: string?, choose: boolean, place: string)
 		s.editor.browser.picker.subtitle = "Choose a starting folder"
 		if s.collapsed then request_sidebar(s, "expand") end
 		browse(s, nil)
+		return
 	end
 	start_launch(s, choose)
 end
@@ -871,7 +995,11 @@ local function menu_entries(s: any, key: string): {string}
 		return out
 	elseif row.kind == "project" then
 		if s.view == "mine" then return {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "-", "edit-project…", "remove-project…", "-", "panel-options"} end
-		return {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "-", "save-as-project…", "-", "panel-options"}
+		local entries = {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "-", "save-as-project…"}
+		if (row.ref.root or "") ~= "" then table.insert(entries, "ignore-source-folder…") end
+		table.insert(entries, "-")
+		table.insert(entries, "panel-options")
+		return entries
 	end
 	return {}
 end
@@ -918,6 +1046,7 @@ local MENU_META: {[string]: any} = {
 	["edit-project…"] = {label = "Edit project…", icon = "sliders"},
 	["remove-project…"] = {label = "Remove project…", icon = "trash", tone = "error"},
 	["save-as-project…"] = {label = "Save as project…", icon = "folder-plus"},
+	["ignore-source-folder…"] = {label = "Ignore source folder…", icon = "slash-circle"},
 	["create"] = {label = "Create project…", icon = "plus"},
 	["refresh"] = {label = "Refresh", icon = "redo", hint = {"ctrl", "r"}},
 	["scope=workspace"] = {label = "Worktree", icon = "folder"},
@@ -954,6 +1083,19 @@ local function confirm_remove(s: any, p: any)
 	s.confirm = {kind = "remove", title = "Remove “" .. project_name(p) .. "”?", body = {
 		c.note("The project is removed from your sidebar. Chats and source folders will not be deleted. Chats you moved here go back to matching by folder."),
 	}, buttons = {{id = "cancel", label = "Cancel"}, {id = "remove-confirm", label = "Remove project", variant = "danger"}}, focus = 1}
+end
+local function confirm_ignore(s: any, p: any)
+	cancel_flow(s)
+	local path = p.root or ""
+	s.confirm = {kind = "ignore", title = "Ignore source folder?", body = {
+		ui.el("div", {class = "tp-subject"}, {
+			ui.node("icon", {name = "folder"}),
+			ui.el("div", {class = "tp-subject-t"}, {ui.node("text", {text = path, lines = 3, title = path, role = "tern-projects.path"})}),
+		}),
+		c.note("Chats started in this folder or any of its subfolders, including its worktrees, are hidden from Projects, Recents, Pinned, Search and counts, now and in future."),
+		c.note("Nothing is deleted or moved. Chats, projects, pins and archive state stay as they are."),
+		c.note("Undo anytime in Settings → Ignored source folders.", "muted"),
+	}, buttons = {{id = "cancel", label = "Cancel"}, {id = "ignore-confirm", label = "Ignore folder", variant = "primary"}}, focus = 1, data = {path = path}}
 end
 local function confirm_delete(s: any, chat: any)
 	s.menu = nil; s.picker = nil
@@ -1157,6 +1299,17 @@ local function activate(s: any, key: string?)
 		enter_search(s)
 	end
 end
+-- Keymaps live in the window, not the host. Refresh only while Settings is open.
+local function watch_shortcuts(s: any)
+	s.shortcut_watch = (s.shortcut_watch or 0) + 1
+	local generation = s.shortcut_watch
+	local function tick()
+		if not live(s) or s.mode ~= "settings" or s.shortcut_watch ~= generation then return end
+		open_window_url(s, "tern-projects://shortcuts?")
+		tern.timer(1000, tick)
+	end
+	tick()
+end
 local function change_mode(s: any, mode: string)
 	if mode == "search" then
 		if s.search_cwd then s.search_cwd = nil end
@@ -1165,6 +1318,7 @@ local function change_mode(s: any, mode: string)
 	end
 	cancel_flow(s)
 	s.mode = mode; s.page = 0; s.settings_focus = nil
+	if mode == "settings" then watch_shortcuts(s) end
 	rebuild(s); reload(s)
 	s.cx:frame({{"focus", NULL}})
 end
@@ -1176,7 +1330,7 @@ end
 
 -- Actions ------------------------------------------------------------------------------------
 
-local SETTINGS = {"default", "icons", "auto-tabs", "card", "collapse-style", "archived", "refresh"}
+local SETTINGS = {"default", "icons", "auto-tabs", "card", "collapse-style", "archived", "ignored", "refresh", "shortcut-projects", "shortcut-search", "shortcut-settings", "keyboard", "keyconfig"}
 local function hide_busy(s: any)
 	cancel_flow(s)
 	s.editor = nil; s.archived_picker = nil
@@ -1193,6 +1347,10 @@ local function picker_action(s: any, act: string?)
 		if p.query then tf.set(p.query, ""); p.query_all = false; picker.settle(p) end
 		return
 	end
+	if act == "retry-harnesses" and (p.kind == "harness" or p.kind == "default-harness") then
+		harness_picker(s, p.data.purpose)
+		return
+	end
 	local it = picker.selected_item(p)
 	if p.kind == "harness" then
 		if (act == "choose" or act == "choose-default") and it and not it.disabled and p.state == "ready" then
@@ -1200,12 +1358,12 @@ local function picker_action(s: any, act: string?)
 				mutate(s, {op = "settings-update", default_harness = it.id}, function()
 					s.settings.default_harness = it.id
 					toast(s, "success", "Default harness set to " .. it.label)
-					if s.picker == p then launch_plan(s, it.id) end
+					if s.picker == p then launch_plan(s, it.id, false) end
 				end)
-			else launch_plan(s, it.id) end
+			else launch_plan(s, it.id, false) end
 		end
 	elseif p.kind == "default-harness" then
-		if act == "choose" and it and not it.disabled then
+		if act == "choose" and it and not it.disabled and p.state == "ready" then
 			if table.find(p.current, it.id) then cancel_flow(s); return end
 			local value = if it.id == "ask" then NULL else it.id
 			mutate(s, {op = "settings-update", default_harness = value}, function() s.picker = nil; toast(s, "success", if it.id == "ask" then "New chat will ask for a harness" else "New chat uses " .. it.label) end)
@@ -1239,6 +1397,16 @@ local function picker_action(s: any, act: string?)
 			s.archived_picker = p
 			confirm_delete(s, chat)
 		end
+	elseif p.kind == "ignored" then
+		if act == "ignored-retry" then load_ignored(s, p); return end
+		if act ~= "unignore" or not it or p.state ~= "ready" then return end
+		local path = it.id
+		mutate(s, {op = "source-unignore", path = path}, function(data)
+			toast(s, "success", "Folder unignored", "Remaining overlapping rules still apply.")
+			if s.picker == p then
+				if data and data.ignored_sources then set_ignored_items(s, p, data.ignored_sources) else load_ignored(s, p) end
+			end
+		end, function() if s.picker == p then load_ignored(s, p) end end)
 	end
 end
 local function confirm_action(s: any, id: string)
@@ -1269,6 +1437,12 @@ local function confirm_action(s: any, id: string)
 			s.confirm = nil
 			toast(s, "success", "Project removed", "Chats and folders were not changed.")
 			if s.project_id == pid then s.project_id = nil; s.project_label = nil; s.search_cwd = nil; s.offset = 0 end
+		end) end
+	elseif id == "ignore-confirm" then
+		local path = conf.data.path
+		if path ~= "" then mutate(s, {op = "source-ignore", path = path}, function()
+			if s.confirm == conf then s.confirm = nil end
+			toast(s, "success", "Folder ignored", "Undo in Settings → Ignored source folders.")
 		end) end
 	elseif id == "delete-confirm" then
 		local p = s.delete_preview
@@ -1383,10 +1557,24 @@ local function row_action(s: any, act: string, key: string)
 	if NEW_CHAT_PLACES[act] then new_chat(s, key, act == "new-chat-with…", NEW_CHAT_PLACES[act])
 	elseif act == "edit-project…" then open_editor(s, p)
 	elseif act == "save-as-project…" then open_editor(s, {name = project_name(p), folders = {p.root}})
+	elseif act == "ignore-source-folder…" and s.view == "discovered" and (p.root or "") ~= "" then confirm_ignore(s, p)
 	elseif act == "remove-project…" then confirm_remove(s, p) end
 end
 action = function(s: any, act: string, value: string?)
 	if act == "dismiss-error" then s.error = nil; return end
+	if act == "cancel-launch" then
+		if s.launch_pending then cancel_flow(s); toast(s, "info", "New chat cancelled") end
+		return
+	end
+	if act == "keyboard" or act == "keyconfig" then
+		s.settings_focus = act
+		open_window_url(s, "tern-projects://" .. act .. "?")
+		return
+	elseif act == "shortcut-copy" and (value == "projects" or value == "search" or value == "settings") then
+		s.settings_focus = "shortcut-" .. value
+		copy(s, "plugin.tern-projects." .. value, "shortcut action ID")
+		return
+	end
 	if s.busy then return end
 	if act == "editor" then local a, v = string.match(fmt.unpct(value or ""), "^([^=]+)=(.*)$"); editor_intent(s, a or fmt.unpct(value or ""), v); return end
 	if act == "mode" then change_mode(s, value or "projects")
@@ -1453,6 +1641,7 @@ action = function(s: any, act: string, value: string?)
 		end
 		store.set(store.STYLE_KEY, style)
 	elseif act == "archived" then s.settings_focus = "archived"; archived_picker(s)
+	elseif act == "ignored" then s.settings_focus = "ignored"; ignored_picker(s)
 	else
 		local target_key = if value then fmt.unpct(value) else (s.sel or "")
 		local target_row = s.rows[target_key]
@@ -1523,7 +1712,10 @@ local function settings_key(s: any, k: Key): boolean
 		elseif f == "card" then action(s, "card", nil)
 		elseif f == "collapse-style" then action(s, "collapse-style", nil)
 		elseif f == "archived" then action(s, "archived", nil)
-		elseif f == "refresh" then refresh(s) end
+		elseif f == "ignored" then action(s, "ignored", nil)
+		elseif f == "refresh" then refresh(s)
+		elseif f == "keyboard" or f == "keyconfig" then action(s, f, nil)
+		elseif string.sub(f, 1, 9) == "shortcut-" then action(s, "shortcut-copy", string.sub(f, 10)) end
 		return true
 	end
 	return false
@@ -1585,9 +1777,9 @@ local function projects_bar(s: any, cols: number): any
 	if s.indexing then table.insert(kids, ui.el("span", {class = "tp-spin", title = "Indexing chat history…"}, {ui.node("spinner", {style = "ring"})})) end
 	local shortcut = if tern.runtime.os == "macos" then "⌘N" else "Ctrl+N"
 	if cols >= 48 then
-		table.insert(kids, c.button(if cols >= 56 then launch_hint(s) else "New chat", "new-chat", {key = "new-chat", icon = "pen", size = "sm", title = launch_hint(s) .. " (" .. shortcut .. ")"}))
+		table.insert(kids, c.button(if cols >= 56 then launch_hint(s) else "New chat", "new-chat", {key = "new-chat", icon = "pen", size = "sm", disabled = s.launch_pending, title = launch_hint(s) .. " (" .. shortcut .. ")"}))
 	else
-		table.insert(kids, c.icon_button("pen", "new-chat", launch_hint(s) .. " (" .. shortcut .. ")", {key = "new-chat", size = "sm"}))
+		table.insert(kids, c.icon_button("pen", "new-chat", launch_hint(s) .. " (" .. shortcut .. ")", {key = "new-chat", size = "sm", disabled = s.launch_pending}))
 	end
 	table.insert(kids, c.icon_button("redo", "refresh", if s.indexing then "Indexing chat history…" else "Refresh chat history (Ctrl+R)", {key = "refresh", size = "sm", disabled = s.indexing}))
 	return ui.el("div", {key = "bar", class = "tp-bar"}, kids)
@@ -1776,6 +1968,19 @@ local function collapse_hint(): string
 	if style == "tile" then return "A card over the chat's top-left corner: Expand, the latest chats and New chat." end
 	return "Hidden; " .. (if tern.runtime.os == "macos" then "Cmd+Alt+S" else "Ctrl+Alt+S") .. " or the status bar's Projects button shows it again."
 end
+local function shortcut_keys(chords: {string}?): any
+	if not chords then return c.note("Loading…") end
+	if #chords == 0 then return c.note("Not bound") end
+	local keys = {}
+	for i, chord in chords do
+		if i > 1 then table.insert(keys, ui.el("span", {text = "or", class = "tp-note"})) end
+		for j, step in string.split(chord, ">") do
+			if j > 1 then table.insert(keys, ui.el("span", {text = "then", class = "tp-note"})) end
+			table.insert(keys, ui.node("kbd", {keys = string.split(step, "+")}))
+		end
+	end
+	return ui.el("div", {class = "tp-shortcut-keys"}, keys)
+end
 local function settings_view(s: any): any
 	local f = s.settings_focus
 	local default = s.settings.default_harness
@@ -1783,9 +1988,18 @@ local function settings_view(s: any): any
 	local index_desc = if s.indexing then "Indexing chat history…" elseif s.indexed_at then "Updated " .. fmt.ago(s.indexed_at * 1000) .. " · every 2 min" else "Updated automatically · every 2 min"
 	local archived = s.archived_total
 	local mod = if tern.runtime.os == "macos" then "cmd" else "ctrl"
+	local global_keys = {}
+	for _, sc in {{"projects", "Open Projects"}, {"search", "Search everywhere"}, {"settings", "Projects Settings"}} do
+		table.insert(global_keys, ui.el("div", {key = sc[1], class = "tp-kbd-row"}, {
+			ui.el("span", {text = sc[2]}),
+			ui.el("div", {class = "tp-shortcut-controls"}, {
+				if s.shortcut_error then c.note("Unavailable")
+					else shortcut_keys(s.shortcut_bindings and s.shortcut_bindings[sc[1]]),
+				c.icon_button("copy", "shortcut-copy=" .. sc[1], "Copy action ID for " .. sc[2], {size = "xs", variant = "ghost", focused = f == "shortcut-" .. sc[1]}),
+			}),
+		}))
+	end
 	local shortcuts: {{any}} = {
-		{"Open Projects", if tern.runtime.os == "macos" then {"alt", "cmd", "s"} else {"ctrl", "alt", "s"}},
-		{"Search everywhere", if tern.runtime.os == "macos" then {"ctrl", "alt", "cmd", "s"} else {"ctrl", "alt", "shift", "s"}},
 		{"Search from Projects / Settings", {"/"}},
 		{"Cycle Mine / Discovered / Search / Settings", {"tab"}},
 		{"Cycle views backwards", {"shift", "tab"}},
@@ -1837,10 +2051,25 @@ local function settings_view(s: any): any
 		ui.el("div", {class = "tp-card"}, {
 			setting_row("archived", f == "archived", "Archived chats", if archived and archived > 0 then fmt.plural(archived, "chat") .. " hidden from lists and search." else "Archived chats are hidden from lists and search.",
 				c.button("View", "archived", {size = "sm", focused = f == "archived"})),
+			setting_row("ignored", f == "ignored", "Ignored source folders",
+				if s.ignored_sources and #s.ignored_sources > 0 then fmt.plural(#s.ignored_sources, "folder") .. " and subfolders hidden from lists and search."
+				else "Hide a folder with Ignore source folder… in Discovered.",
+				c.button("Manage", "ignored", {size = "sm", focused = f == "ignored"})),
 			setting_row("refresh", f == "refresh", "Chat index", index_desc,
 				c.button(if s.indexing then "Refreshing…" else "Refresh", "refresh", {size = "sm", icon = "redo", disabled = s.indexing, focused = f == "refresh"})),
 		}),
-		ui.el("div", {class = "tp-sec-t", text = "Keyboard"}),
+		ui.el("div", {class = "tp-sec-t", text = "Global shortcuts"}),
+		ui.el("div", {class = "tp-card tp-keys"}, global_keys),
+		ui.el("div", {class = "tp-card"}, {
+			setting_row("keyboard", f == "keyboard", "Customize shortcuts", "In Tern Settings, choose Keyboard and search for Projects.",
+				c.button("Edit in Tern", "keyboard", {size = "sm", focused = f == "keyboard"})),
+			setting_row("keyconfig", f == "keyconfig", "Unbound commands", "Tern may omit these from Keyboard. Copy an action ID above and add it to keybinds in settings.json.",
+				c.button("Open settings.json", "keyconfig", {size = "sm", focused = f == "keyconfig"})),
+		}),
+		c.note(if s.shortcut_error then "Could not read Tern’s shortcuts: " .. s.shortcut_error
+			else "Shows Tern’s effective shortcuts, including presets and your overrides."),
+		ui.el("div", {class = "tp-sec-t", text = "Panel controls"}),
+		c.note("These controls apply inside the Projects panel and are not changed in Tern’s shortcut editor."),
 		ui.el("div", {class = "tp-card tp-keys"}, keys),
 	})
 end
@@ -2016,6 +2245,7 @@ local panel: BlockDef<any> = {
 		end
 		tern.timer(80, function() if live(s) then open_window_url(s, "tern-projects://sidebar?state=sync&pane=" .. tostring(s.cx.pane)) end end)
 		rebuild(s)
+		if s.mode == "settings" then watch_shortcuts(s) end
 		refresh(s)
 		local function tick()
 			tern.timer(120000, function() if not live(s) then s.alive = false; return end; refresh(s); tick() end)
@@ -2088,6 +2318,9 @@ local panel: BlockDef<any> = {
 			table.insert(buttons, c.icon_button("x", "dismiss-error", "Dismiss", {variant = "ghost", size = "xs"}))
 			table.insert(children, c.banner("error", "error", "warn", fmt.error(s.error), buttons))
 		end
+		if s.launch_pending and not s.editor and not s.picker and not s.confirm then
+			table.insert(children, c.banner("launching", "info", nil, wait_text(s, false), {c.button("Cancel", "cancel-launch", {size = "xs", variant = "ghost"})}, true))
+		end
 		if s.busy and not s.editor and not s.picker and not s.confirm then table.insert(children, c.banner("busy", "info", nil, (s.busy_label or "Working…") .. " The change is continuing.", nil, true)) end
 		if s.mode == "settings" then
 			table.insert(children, settings_view(s))
@@ -2109,6 +2342,7 @@ local panel: BlockDef<any> = {
 			if k.name == "enter" or k.name == "space" or k.name == "right" then request_sidebar(s, "expand"); return true end
 			return false
 		end
+		if k.name == "escape" and s.launch_pending then action(s, "cancel-launch", nil); return true end
 		if s.busy then if k.name == "escape" then hide_busy(s) end; return true end
 		if s.editor then
 			local d = s.editor
@@ -2209,6 +2443,17 @@ local panel: BlockDef<any> = {
 	event = function(s, ev, cx)
 		if type(ev.window) == "string" then s.window = ev.window end
 		local id, name = ev.id or "", ev.ev
+		if name == "action" and ev.act == "shortcut-state" then
+			if s.mode ~= "settings" or s.shortcut_payload == ev.value then return end
+			local ok, data = pcall(tern.json.decode, ev.value or "")
+			if ok and type(data) == "table" then
+				s.shortcut_payload = ev.value
+				s.shortcut_bindings = data.bindings
+				s.shortcut_error = data.error
+				cx:render()
+			end
+			return
+		end
 		if s.menu and string.sub(id, 1, 11) ~= "layer.menu." and id ~= "layer.menu" then s.menu = nil end
 		if name == "focus" or name == "edit" then
 			if s.busy then return end
@@ -2256,7 +2501,8 @@ local panel: BlockDef<any> = {
 			end
 		elseif name == "action" then
 			local act, value = ev.act or "", ev.value
-			if act == "live-panes" then
+			if act == "cancel-launch" then action(s, act, value)
+			elseif act == "live-panes" then
 				s.open_chats = if type(ev.open) == "table" then ev.open else {}
 				s.open_sessions = if type(ev.sessions) == "table" then ev.sessions else {}
 				s.parked = if type(ev.parked) == "table" then ev.parked else {}

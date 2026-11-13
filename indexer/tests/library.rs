@@ -611,3 +611,66 @@ fn rename_persists_across_rebuild_syncs_fts_and_migrates_v1_library() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn project_folder_changes_retain_chats_and_source_ignores_hide_everywhere() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let repo = home.join("repo");
+    let sub = repo.join("sub");
+    let other = home.join("other");
+    for folder in [&sub, &other] {
+        std::fs::create_dir_all(folder).unwrap();
+    }
+    seed(&home, "root", &repo, 100);
+    seed(&home, "sub", &sub, 200);
+    seed(&home, "other", &other, 300);
+    run(&db, &home, &["index"]);
+
+    let pid = create(&db, &home, "Repo", json!([repo]));
+    assert_eq!(uids(&project(&snapshot(&db, &home), &pid)["sessions"]), ["omp:sub", "omp:root"]);
+
+    // Moving project folders retains previously matched chats in `project_chats`.
+    library(&db, &home, json!({"op":"project-save","id":pid,"name":"Repo","icon":"folder","folders":[other]}));
+    assert_eq!(
+        uids(&project(&snapshot(&db, &home), &pid)["sessions"]),
+        ["omp:other", "omp:sub", "omp:root"]
+    );
+
+    // Ignore source folder hides matching chats and restores cleanly on unignore.
+    library(&db, &home, json!({"op":"source-ignore","path":repo}));
+    let snap = snapshot(&db, &home);
+    assert_eq!(uids(&snap["recent"]), ["omp:other"]);
+    assert_eq!(uids(&project(&snap, &pid)["sessions"]), ["omp:other"]);
+    assert_eq!(run(&db, &home, &["query", "--q", "needle"])["total"], 1);
+
+    library(&db, &home, json!({"op":"source-unignore","path":resolved(&repo)}));
+    let after = snapshot(&db, &home);
+    assert_eq!(after["ignored_sources"], json!([]));
+    assert_eq!(run(&db, &home, &["query", "--q", "needle"])["total"], 3);
+
+    // Also verify upstream v3 (with project_chats + ignored_sources, no custom_title) migrates cleanly to v4.
+    let v3_dir = temp.path().join("v3_mig");
+    std::fs::create_dir_all(&v3_dir).unwrap();
+    let v3_db = v3_dir.join("index.sqlite");
+    let v3_lib = v3_dir.join("library.sqlite");
+    let c = rusqlite::Connection::open(&v3_lib).unwrap();
+    c.execute_batch(
+        "CREATE TABLE projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,icon TEXT NOT NULL,created_ms INTEGER NOT NULL);
+         CREATE TABLE project_folders(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position),UNIQUE(project_id,path));
+         CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER);
+         CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+         CREATE TABLE project_chats(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,uid TEXT NOT NULL,PRIMARY KEY(project_id,uid));
+         CREATE TABLE ignored_sources(path TEXT PRIMARY KEY,resolved TEXT NOT NULL);
+         INSERT INTO projects VALUES(1,'V3Proj','folder',100);
+         INSERT INTO project_folders VALUES(1,0,'/tmp/v3');
+         INSERT INTO project_chats VALUES(1,'omp:root');
+         PRAGMA user_version=3;"
+    ).unwrap();
+    drop(c);
+    let snap_v3 = snapshot(&v3_db, &home);
+    assert_eq!(snap_v3["projects"][0]["name"], "V3Proj");
+    let c2 = rusqlite::Connection::open(&v3_lib).unwrap();
+    assert_eq!(c2.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+}

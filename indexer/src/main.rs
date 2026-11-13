@@ -306,8 +306,8 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
     match request {
         Request::Snapshot { view, per, recent } => sessions::snapshot(db_path, &home_str, &view, per, recent),
         Request::ProjectSave { id, name, icon, folders, cwd } => {
-            let mut lib = library::Library::open(db_path)?;
-            let saved = lib.save_project(id.as_deref(), &name, &icon, &folders, &cwd, home)?;
+            let (index, mut lib) = sessions::open(db_path)?;
+            let saved = lib.save_project(id.as_deref(), &name, &icon, &folders, &cwd, home, &index)?;
             sessions::saved_project(db_path, &home_str, saved["project"]["id"].as_str().context("missing saved project ID")?)
         }
         Request::ProjectRemove { id } => library::Library::open(db_path)?.remove_project(&id),
@@ -336,6 +336,9 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
         Request::Delete { uid, expected_source, expected_version } => {
             delete::execute(db_path, home, &uid, &expected_source, &expected_version)
         }
+        Request::SourceIgnore { path, cwd } => library::Library::open(db_path)?.ignore_source(&path, &cwd, home),
+        Request::SourceUnignore { path } => library::Library::open(db_path)?.unignore_source(&path),
+        Request::SourceIgnores => Ok(json!({"ignored_sources": library::Library::open(db_path)?.ignored_sources()?})),
     }
 }
 

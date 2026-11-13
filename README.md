@@ -59,6 +59,7 @@ The Rust indexer builds automatically on first load.
 ### 6. Windows & OMP Stability Fixes
 - Eliminates Windows `\\?\` verbatim path prefixes across indexed sessions, Git root resolution, folder browsing, and harness launches.
 - Collapses rotated OMP session chains (`continuationOf` and legacy pre-18.13 rotations) into a single entry while keeping `/new` sessions and forks separate, and deletes every file in a chain when permanently deleting an OMP chat.
+- Selective upstream sync (`v0.2.4`–`v0.2.14` fixes, without upstream self-update checks): reversible **Ignore source folder…** rules in Discovered and **Settings → Ignored source folders**, retained project chats across folder edits (`library.sqlite` v4), ACP resume preference handling (`auto_acp` / `keep_tui`), live **Global shortcuts** inspection in Settings, responsive **New chat** timeout/cancel handling, OMP prompt-history cleanup & hardened fail-closed deletions across all harnesses, improved Cargo `PATH` discovery, and Tern 0.9.5 pane-lookup / `status_bar` preference guards.
 
 ---
 

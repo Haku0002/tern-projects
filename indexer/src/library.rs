@@ -62,6 +62,15 @@ pub enum Request {
         expected_source: String,
         expected_version: String,
     },
+    SourceIgnore {
+        path: String,
+        #[serde(default)]
+        cwd: String,
+    },
+    SourceUnignore {
+        path: String,
+    },
+    SourceIgnores,
 }
 
 // Option<Value> cannot distinguish an absent field from an explicit JSON null.
@@ -115,9 +124,8 @@ impl Library {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version == 0 || version == 1 {
-            // Another opener may initialize or migrate the library while we wait for this lock.
-            // Only the version read under the write lock can authorize schema changes.
+        if version < 4 {
+            // Recheck under the write lock before initializing or migrating.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             if version == 0 {
@@ -135,16 +143,27 @@ impl Library {
                     CREATE TABLE project_folders(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position),UNIQUE(project_id,path));
                     CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER,custom_title TEXT);
                     CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                    PRAGMA user_version=2;")?;
-            } else if version == 1 {
-                // Validate pre-migration v1 schema before altering it.
-                validate_v1_schema(&tx)?;
+                    CREATE TABLE project_chats(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,uid TEXT NOT NULL,PRIMARY KEY(project_id,uid));
+                    CREATE TABLE ignored_sources(path TEXT PRIMARY KEY,resolved TEXT NOT NULL);
+                    PRAGMA user_version=4;")?;
+            } else if (1..=3).contains(&version) {
+                // Validate core tables before upgrading from any v1/v2/v3 variant.
+                validate_core_tables(&tx)?;
+                if !has_column(&tx, "chat_state", "custom_title")? {
+                    tx.execute_batch("ALTER TABLE chat_state ADD COLUMN custom_title TEXT;")?;
+                }
                 tx.execute_batch(
-                    "ALTER TABLE chat_state ADD COLUMN custom_title TEXT; PRAGMA user_version=2;",
+                    "CREATE TABLE IF NOT EXISTS project_chats(
+                        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                        uid TEXT NOT NULL,
+                        PRIMARY KEY(project_id,uid)
+                    );
+                    CREATE TABLE IF NOT EXISTS ignored_sources(path TEXT PRIMARY KEY,resolved TEXT NOT NULL);
+                    PRAGMA user_version=4;",
                 )?;
             } else {
                 anyhow::ensure!(
-                    version == 2,
+                    version == 4,
                     "unsupported library schema version {version}; library was not overwritten"
                 );
             }
@@ -152,7 +171,7 @@ impl Library {
             tx.commit()?;
         } else {
             anyhow::ensure!(
-                version == 2,
+                version == 4,
                 "unsupported library schema version {version}; library was not overwritten"
             );
             validate_library(&conn)?;
@@ -223,6 +242,7 @@ impl Library {
         );
         Ok(json!({"default_harness":default,"icon_style":style}))
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn save_project(
         &mut self,
         project_id: Option<&str>,
@@ -231,6 +251,7 @@ impl Library {
         folders: &[String],
         cwd: &str,
         home: &Path,
+        index: &Connection,
     ) -> Result<Value> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "Name: enter a project name");
@@ -256,7 +277,7 @@ impl Library {
                         .is_some_and(|p| p.folders.iter().any(|s| Path::new(s) == expanded)) =>
                 {
                     let _ = e;
-                    lexical(&expanded)
+                    simplified(lexical(&expanded))
                 }
                 Err(e) => return Err(e).context("Source folders"),
             };
@@ -264,9 +285,51 @@ impl Library {
                 paths.push(normalized.to_string_lossy().into_owned());
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let project_id = if let Some(project_id) = project_id {
-            let project_id = id(project_id)?;
+            let project_key = project_id;
+            let project_id = id(project_key)?;
+            // Re-read folders under the library write lock. Keep current chat
+            // identities, not a live rule for an old path that may be reused.
+            let old_folders = {
+                let mut stmt = tx.prepare(
+                    "SELECT path FROM project_folders WHERE project_id=? ORDER BY position",
+                )?;
+                let mut rows = Vec::new();
+                for folder in stmt.query_map([project_id], |r| r.get::<_, String>(0))? {
+                    let folder = simplified(folder?);
+                    if !rows.contains(&folder) {
+                        rows.push(folder);
+                    }
+                }
+                rows
+            };
+            anyhow::ensure!(!old_folders.is_empty(), "project no longer exists");
+            if old_folders.len() != paths.len()
+                || old_folders.iter().any(|folder| !paths.contains(folder))
+            {
+                let mut previous = old.context("missing project before folder change")?;
+                previous.folders = old_folders;
+                let mut membership = Membership::new(vec![previous]);
+                let mut sessions = index.prepare(
+                    "SELECT s.uid,s.cwd FROM sessions s
+                     LEFT JOIN library.chat_state cs ON cs.uid=s.uid
+                     WHERE COALESCE(cs.assignment,'automatic')='automatic'",
+                )?;
+                let mut records = sessions.query([])?;
+                let mut retain = tx.prepare(
+                    "INSERT OR IGNORE INTO project_chats(project_id,uid) VALUES(?,?)",
+                )?;
+                while let Some(row) = records.next()? {
+                    let uid: String = row.get(0)?;
+                    let cwd: String = row.get(1)?;
+                    if membership.matches(project_key, &uid, &cwd, "automatic", None) {
+                        retain.execute(params![project_id, uid])?;
+                    }
+                }
+            }
             tx.execute(
                 "UPDATE projects SET name=?,icon=? WHERE id=?",
                 params![name, icon, project_id],
@@ -291,6 +354,20 @@ impl Library {
         }
         tx.commit()?;
         Ok(json!({"project":self.project(&project_id.to_string())?}))
+    }
+    pub fn membership(&self) -> Result<Membership> {
+        let mut membership = Membership::new(self.projects()?);
+        let mut stmt = self.conn.prepare("SELECT project_id,uid FROM project_chats")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let project_id = row.get::<_, i64>(0)?.to_string();
+            membership
+                .retained
+                .entry(project_id)
+                .or_default()
+                .insert(row.get(1)?);
+        }
+        Ok(membership)
     }
     pub fn remove_project(&mut self, project_id: &str) -> Result<Value> {
         self.project(project_id)?;
@@ -401,6 +478,48 @@ impl Library {
         tx.commit()?;
         Ok(json!({"settings":self.settings()?}))
     }
+    /// `[{path}]`; each path is the exact identity `unignore_source` accepts.
+    pub fn ignored_sources(&self) -> Result<Value> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM ignored_sources ORDER BY path")?;
+        let rules = stmt
+            .query_map([], |r| Ok(json!({"path": r.get::<_, String>(0)?})))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Value::Array(rules))
+    }
+    pub fn ignore_source(&mut self, value: &str, cwd: &str, home: &Path) -> Result<Value> {
+        // Missing historical folders stay valid: no existence check.
+        let path = expand(value, cwd, home).context("Source folder")?;
+        anyhow::ensure!(path.is_absolute(), "Source folder: an absolute path is required");
+        let path = path.to_string_lossy();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ignored_sources(path,resolved) VALUES(?,?)",
+            params![&*path, &*normalized(&path).to_string_lossy()],
+        )?;
+        Ok(json!({"ignored_sources":self.ignored_sources()?}))
+    }
+    pub fn unignore_source(&mut self, path: &str) -> Result<Value> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM ignored_sources WHERE path=?", [path])?;
+        anyhow::ensure!(removed == 1, "ignored source folder no longer exists");
+        Ok(json!({"ignored_sources":self.ignored_sources()?}))
+    }
+    pub fn ignores(&self) -> Result<Ignores> {
+        let mut stmt = self.conn.prepare("SELECT path,resolved FROM ignored_sources")?;
+        let mut rows = stmt.query([])?;
+        let mut rules = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let resolved: String = row.get(1)?;
+            rules.push(lexical(Path::new(&path)));
+            rules.push(normalized(&path));
+            rules.push(PathBuf::from(resolved));
+        }
+        rules.retain(|rule| rule.is_absolute());
+        Ok(Ignores { rules, cache: HashMap::new() })
+    }
 }
 
 fn validate_library(conn: &Connection) -> Result<()> {
@@ -410,7 +529,17 @@ fn validate_library(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn validate_v1_schema(conn: &Connection) -> Result<()> {
+fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|c| c == col);
+    Ok(found)
+}
+
+fn validate_core_tables(conn: &Connection) -> Result<()> {
     validate_tables(
         conn,
         &[
@@ -431,19 +560,26 @@ fn validate_v1_schema(conn: &Connection) -> Result<()> {
                     ("path", "TEXT", 0),
                 ],
             ),
-            (
-                "chat_state",
-                &[
-                    ("uid", "TEXT", 1),
-                    ("assignment", "TEXT", 0),
-                    ("project_id", "INTEGER", 0),
-                    ("pinned_ms", "INTEGER", 0),
-                    ("archived_ms", "INTEGER", 0),
-                ],
-            ),
             ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
         ],
-    )
+    )?;
+    let mut stmt = conn.prepare("PRAGMA table_info(chat_state)")?;
+    let cols: Vec<(String, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let core = [
+        ("uid", "TEXT", 1),
+        ("assignment", "TEXT", 0),
+        ("project_id", "INTEGER", 0),
+        ("pinned_ms", "INTEGER", 0),
+        ("archived_ms", "INTEGER", 0),
+    ];
+    anyhow::ensure!(
+        cols.len() >= core.len()
+            && cols.iter().zip(core).all(|(a, e)| a.0 == e.0 && a.1.eq_ignore_ascii_case(e.1) && a.2 == e.2),
+        "malformed library schema: unsupported chat_state columns or primary key"
+    );
+    Ok(())
 }
 
 fn validate_schema(conn: &Connection) -> Result<()> {
@@ -479,11 +615,13 @@ fn validate_schema(conn: &Connection) -> Result<()> {
                 ],
             ),
             ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
+            ("project_chats", &[("project_id", "INTEGER", 1), ("uid", "TEXT", 2)]),
+            ("ignored_sources", &[("path", "TEXT", 1), ("resolved", "TEXT", 0)]),
         ],
     )
 }
-
-fn validate_tables(conn: &Connection, tables: &[(&str, &[(&str, &str, i64)])]) -> Result<()> {
+type TableSpec<'a> = (&'a str, &'a [(&'a str, &'a str, i64)]);
+fn validate_tables(conn: &Connection, tables: &[TableSpec<'_>]) -> Result<()> {
     for (table, expected) in tables {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = stmt
@@ -675,12 +813,53 @@ pub fn folders(value: &str, cwd: &str, home: &Path, offset: i64, limit: i64) -> 
     Ok(json!({"path":path,"parent":path.parent(),"entries":entries,"total":total}))
 }
 
+/// Source-folder ignore rules matched by path components against both the
+/// recorded and the resolved form of a path.
+pub struct Ignores {
+    rules: Vec<PathBuf>,
+    cache: HashMap<String, bool>,
+}
+impl Ignores {
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+    pub fn covers(&mut self, path: &str) -> bool {
+        if let Some(&hit) = self.cache.get(path) {
+            return hit;
+        }
+        let raw = lexical(Path::new(path));
+        // Relative paths would resolve against this process's cwd.
+        let hit = raw.is_absolute()
+            && (self.rules.iter().any(|rule| raw.starts_with(rule)) || {
+                let resolved = normalized(path);
+                self.rules.iter().any(|rule| resolved.starts_with(rule))
+            });
+        self.cache.insert(path.to_owned(), hit);
+        hit
+    }
+}
+
 pub struct Membership {
     folders: HashMap<String, Vec<PathBuf>>,
     paths: HashMap<String, PathBuf>,
+    retained: HashMap<String, HashSet<String>>,
 }
 fn normalized(path: &str) -> PathBuf {
-    let path = canonical(Path::new(path)).unwrap_or_else(|_| simplified(lexical(Path::new(path))));
+    let path = canonical(Path::new(path)).unwrap_or_else(|_| {
+        let path = simplified(lexical(Path::new(path)));
+        if path.is_absolute() {
+            // Transcripts keep the old cwd after a directory move. Resolve its
+            // surviving parent so aliases such as /var and /private/var agree.
+            for parent in path.ancestors().skip(1) {
+                if let Ok(resolved) = canonical(parent) {
+                    return resolved.join(
+                        path.strip_prefix(parent).expect("ancestor is a path prefix"),
+                    );
+                }
+            }
+        }
+        path
+    });
     #[cfg(windows)]
     {
         PathBuf::from(path.to_string_lossy().to_lowercase())
@@ -699,11 +878,13 @@ impl Membership {
         Self {
             folders,
             paths: HashMap::new(),
+            retained: HashMap::new(),
         }
     }
     pub fn matches(
         &mut self,
         project_id: &str,
+        uid: &str,
         cwd: &str,
         assignment: &str,
         assigned: Option<i64>,
@@ -712,6 +893,9 @@ impl Membership {
             "none" => false,
             "project" => project_id.parse::<i64>().ok() == assigned,
             _ => {
+                if self.retained.get(project_id).is_some_and(|uids| uids.contains(uid)) {
+                    return true;
+                }
                 if !self.paths.contains_key(cwd) {
                     self.paths.insert(cwd.to_owned(), normalized(cwd));
                 }

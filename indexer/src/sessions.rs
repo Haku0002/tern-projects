@@ -9,7 +9,7 @@ use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
 use std::path::Path;
 
-const COLUMNS:&str = "s.uid,s.agent,s.id,s.title,s.cwd,s.project_root,s.worktree_root,s.branch,s.model,s.created_ms,s.updated_ms,s.messages,s.last_assistant,s.resume";
+const COLUMNS:&str = "s.uid,s.agent,s.id,COALESCE(NULLIF(cs.custom_title,''),s.title),s.cwd,s.project_root,s.worktree_root,s.branch,s.model,s.created_ms,s.updated_ms,s.messages,s.last_assistant,s.resume";
 const JOIN: &str = " LEFT JOIN library.chat_state cs ON cs.uid=s.uid ";
 const VISIBLE: &str = "cs.archived_ms IS NULL";
 
@@ -26,20 +26,23 @@ fn rows(conn: &Connection, sql: &str, values: &[SqlValue], home: &str) -> Result
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
         .query_map(params_from_iter(values), |r| {
+            let agent: String = r.get(1)?;
             let root: String = r.get(5)?;
             let assigned: Option<i64> = r.get(18)?;
             let raw: String = r.get(13)?;
-            let resume = serde_json::from_str(&raw).map_err(|e| {
+            let mut resume: Value = serde_json::from_str(&raw).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     13,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?;
+            crate::model::fill_missing_fork(&agent, &mut resume);
             Ok(SessionJson {
                 uid: r.get(0)?,
-                agent: r.get(1)?,
+                agent,
                 id: r.get(2)?,
+                custom_title: r.get::<_, i64>(19)? != 0,
                 title: r.get(3)?,
                 cwd: r.get(4)?,
                 project_label: project_label(&root, home),
@@ -65,7 +68,7 @@ fn rows(conn: &Connection, sql: &str, values: &[SqlValue], home: &str) -> Result
     Ok(rows)
 }
 fn select(snippet: &str) -> String {
-    format!("SELECT {COLUMNS},{snippet},cs.pinned_ms,cs.archived_ms,COALESCE(cs.assignment,'automatic'),cs.project_id FROM sessions s")
+    format!("SELECT {COLUMNS},{snippet},cs.pinned_ms,cs.archived_ms,COALESCE(cs.assignment,'automatic'),cs.project_id,(cs.custom_title IS NOT NULL AND cs.custom_title<>'') FROM sessions s")
 }
 fn page(limit: i64, offset: i64) -> Result<()> {
     anyhow::ensure!(

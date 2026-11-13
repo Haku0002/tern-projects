@@ -1,4 +1,14 @@
-# tern-projects
+# tern-projects (Customized Fork)
+
+> **Fork Notice:** This repository is a customized fork of [thegeneralist01/tern-projects](https://github.com/thegeneralist01/tern-projects) (based on `v0.2.3` / `86c05d4`), maintained at [Haku0002/tern-projects](https://github.com/Haku0002/tern-projects).
+>
+> **Key modifications over upstream:**
+> - **Pinned left sidebar & main-pane workspace**: opening or starting chats swaps/opens beside the sidebar instead of spawning new tabs by default; supports **Open in Main**, **Split Right**, **Split Down**, and **Open in New Tab**, plus live chat deduplication.
+> - **Collapsible sidebar & per-tab persistence**: collapse as **Hide**, **Icon rail**, or floating **Tile**, with per-tab auto-open, remembered width/collapse state, and optional selection card toggle.
+> - **Parked tile deck management**: foldable **Parked** section with live status, inline idle cleanup, direct tile closing, and a status-bar / command-palette picker.
+> - **Safe chat forking & `[Fork] ` prefixing**: fork OMP, Claude Code, and Codex chats via context menu or `Ctrl+B` / `⌘B` without disrupting running sessions; unrenamed forks are automatically prefixed with `[Fork] `.
+> - **Chat renaming (`Rename…` / `F2`) & grouped context menus**: durable custom chat titles (stored in `library.sqlite` with FTS5 sync and **Reset original**, without mutating transcript files) and horizontal dividers grouping context-menu actions.
+> - **Windows & OMP fixes**: strips Windows `\\?\` verbatim path prefixes, groups rotated OMP session chains, and blocks duplicate `omp` launches on already-held sessions.
 
 A curated project sidebar and unified agent history search for [Tern](https://stencil.so/tern).
 
@@ -13,7 +23,7 @@ Bring order to your AI coding sessions across **OMP, Claude Code, Codex, Pi, Ope
 Run this inside Tern:
 
 ```sh
-tern plugin install github.com/thegeneralist01/tern-projects
+tern plugin install github.com/Haku0002/tern-projects
 ```
 
 **Toggle the sidebar:**
@@ -26,7 +36,7 @@ That's it. Tern fetches the plugin, and the background engine builds automatical
 
 To update later:
 ```sh
-tern plugin install github.com/thegeneralist01/tern-projects --force
+tern plugin install github.com/Haku0002/tern-projects --force
 ```
 
 ---
@@ -58,13 +68,35 @@ Optimized for speed and one-handed navigation:
 | **Quick Search** from Projects or Settings | `/` | `/` |
 | **New chat** (in current project/folder) | `⌘ N` | `Ctrl + N` |
 | **New chat with…** (choose harness) | `⇧ ⌘ N` | `Shift + Ctrl + N` |
-| **Resume chat** | `Enter` | `Enter` |
+| **Open chat in the main area** (also double-click, or the dock's Resume) | `Enter` | `Enter` |
+| **Fork chat / Fork in Split Right** | `⌘ B` / `⇧ ⌘ B` | `Ctrl + B` / `Ctrl + Shift + B` |
 | **Fold / unfold project** | `←` / `→` | `←` / `→` |
 | **Context menu / Actions** | `Shift + F10` | `Shift + F10` |
+| **Rename selected chat** | `F2` | `F2` |
 | **Copy resume command** | `⌃ Y` | `Ctrl + Y` |
 | **Dismiss / Clear search / Close modal** | `Esc` | `Esc` |
 
 Inside any text field, standard terminal editing shortcuts just work (`⌘A`/`Ctrl+A` select all, `⌘⌫`/`Ctrl+U` delete line prefix, `⌥⌫`/`Ctrl+⌫` delete word).
+
+### Opening chats
+
+Every new tab starts with the Projects sidebar on its left (turn this off under **Settings → Sidebar → Open in new tabs**). A tab holds at most one; `Ctrl + Alt + S` still toggles it. Clicking a chat or folder shows its card (Resume / New chat, Edit, …) at the bottom of the sidebar; **Settings → Sidebar → Selection card → Off** turns the card off, so a click only selects and the row's right-click menu offers the same actions. Opening a chat never adds a tab unless you ask for one:
+
+- **Open in Main** (default for double-click, `Enter` and Resume) shows the chat in the main area beside the sidebar. The chat it replaces is parked, not closed, so it keeps running; opening it again swaps it back.
+- **Split Right** / **Split Down** open it beside or below the current chat.
+- **Open in New Tab** opens it in a new tab.
+
+- **Fork chat** / **Fork in Split Right / Split Down / New Tab** (on OMP, Claude Code and Codex chats) branches a conversation into a brand-new session (`omp --fork <file>`, `claude --resume <id> --fork-session`, `codex fork <id>`) without touching or stopping the original — even while the original chat is actively running. Unrenamed forks automatically display a `[Fork] ` prefix in their title until renamed via `/rename`.
+A chat that is already open is focused (or swapped back in) instead of starting a second copy, and shows a live status dot (`●` open in a tab, `○` parked in the deck). Project menus offer **New chat in Split Right / Split Down** too; `Ctrl + Enter` (`⌘↵`) opens in Split Right and `Ctrl + Shift + Enter` (`⇧⌘↵`) opens in a new tab. Use **Rename…** (`F2`) in any chat's menu to give it a durable custom title (with **Reset original** to revert) without modifying source transcripts.
+
+When panes sit in Tern's parked-pane deck, a **Parked** section at the top of Projects lists them (foldable, with an inline `×` button to close all idle parked tiles at once): right-click any parked row — or any open/parked chat row anywhere in the sidebar — to **Close parked tile** / **Close chat pane** directly without opening it first (`Delete` also closes a selected parked tile, and **Projects: Close Parked Panes…** in the command palette or status bar works even while the sidebar is hidden). Working chats ask for confirmation before closing.
+The header's sidebar button collapses Projects; **Settings → Sidebar → When collapsed** picks how:
+
+- **Hide** (default) parks the sidebar, so it takes no width; its state survives and no chat is affected. `Ctrl + Alt + S`, or the **Projects** button the status line shows in tabs without a sidebar (when the status bar is on), brings it back at the left edge. While it is hidden, new tabs open without one.
+- **Icon rail** narrows it to a column of buttons: expand, Projects, Search, New chat and Settings. Tern keeps every split at least a tenth of its parent, so the rail can't get narrower than that.
+- **Tile** floats it as a card over the main chat's top-left corner: a large **Expand Projects** button, the three latest chats (they open in the main area as usual) and New chat. The chats behind it get the whole tab width. Expand, or `Ctrl + Alt + S`, docks it back at the left edge.
+
+A sidebar dealt back from Tern's parked-pane tiles also returns to the left edge. A sidebar that opens, returns or docks back appears at its remembered width right away. Width, collapsed state, collapse style and unfolded projects are remembered across restarts; a sidebar collapsed to a tile is still a tile after a restart.
 
 ---
 

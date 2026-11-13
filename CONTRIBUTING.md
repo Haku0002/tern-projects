@@ -39,7 +39,7 @@ To keep this repository easy to maintain for both human developers and future AI
 
 ```sh
 # Clone the repository
-git clone https://github.com/thegeneralist01/tern-projects.git
+git clone https://github.com/Haku0002/tern-projects.git
 cd tern-projects
 
 # Build the release Rust binary and copy to bin/tern-projects

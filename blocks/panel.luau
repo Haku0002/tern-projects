@@ -8,13 +8,75 @@ local input = require("../lib/input")
 local editor = require("../lib/project-editor")
 local picker = require("../lib/picker")
 local c = require("../lib/ui")
+local store = require("../lib/store")
 
 local PAGE = 150 -- rendered list rows; Tern virtualizes (and unwires row actions) past 200
 local SEARCH_PAGE = 50
 local NAME_FIELD = "layer.editor.form.name"
+local RENAME_FIELD = "layer.rename.form.title"
 local SEARCH_FIELD = "main.searchbox.query"
 local NULL = (tern.json :: any).null
+-- The chat a double-click or Enter just opened, briefly; see `activate`. Shared by every sidebar: opening a chat
+-- that already runs in another tab switches to that tab, so the stray click lands on that tab's sidebar.
+local just_opened: string? = nil
+-- Shared capability token proving a `tern-projects://` URL came from this plugin's panel VM, never chat output.
+local AUTH_TOKEN: string = (function()
+	local existing = store.get(store.AUTH_KEY)
+	if type(existing) == "string" and #existing >= 16 then return existing end
+	local fresh = string.format("%x-%x-%s", os.time(), math.floor(tern.now() * 1000), string.gsub(tostring({}), "^table:%s*", ""))
+	store.set(store.AUTH_KEY, fresh)
+	return fresh
+end)()
 
+local function open_window_url(s: any, url: string)
+	local full = url .. "&src=" .. tostring(s.cx.pane) .. "&tok=" .. fmt.pct(AUTH_TOKEN)
+	if type(s.window) == "string" then
+		(s.cx :: any):open(full, {window = s.window})
+	else
+		s.cx:open(full)
+	end
+end
+local function live_for_chat(s: any, chat: any): any
+	if not chat then return nil end
+	local open_chats = s.open_chats
+	if open_chats and chat.uid and open_chats[chat.uid] then return open_chats[chat.uid] end
+	local open_sess = s.open_sessions
+	if not open_sess then return nil end
+	if type(chat.id) == "string" and open_sess[chat.id] then return open_sess[chat.id] end
+	local r = chat.resume
+	if r and type(r.sessions) == "table" then
+		for _, sid in r.sessions do
+			if type(sid) == "string" and open_sess[sid] then return open_sess[sid] end
+		end
+	end
+	return nil
+end
+local function chat_matches_sid(chat: any, sid: string): boolean
+	if chat.id == sid then return true end
+	local r = chat.resume
+	if r and type(r.sessions) == "table" then
+		for _, id in r.sessions do if id == sid then return true end end
+	end
+	return false
+end
+local function known_chat_for_pane(s: any, pane: any): any
+	local uid = if type(pane) == "table" then pane.uid else nil
+	local sid = if type(pane) == "table" then pane.sid else nil
+	local has_uid = type(uid) == "string" and uid ~= ""
+	local has_sid = type(sid) == "string" and sid ~= ""
+	if not has_uid and not has_sid then return nil end
+	for _, list in {s.pinned, s.recent} do
+		for _, chat in list or {} do
+			if (has_uid and chat.uid == uid) or (has_sid and chat_matches_sid(chat, sid)) then return chat end
+		end
+	end
+	for _, p in s.projects or {} do
+		for _, chat in p.sessions or {} do
+			if (has_uid and chat.uid == uid) or (has_sid and chat_matches_sid(chat, sid)) then return chat end
+		end
+	end
+	return nil
+end
 local function pane_alive(id: number): boolean
 	for _, p in tern.pane.list() do if p.pane == id then return true end end
 	return false
@@ -55,6 +117,24 @@ local function rebuild(s: any)
 		for _, b in ref.buttons or {} do add(b.row, "cardbtn", b, k) end
 	end
 	if s.mode == "projects" then
+		local parked_list = s.parked or {}
+		if #parked_list > 0 then
+			local idle_n = 0
+			for _, p in parked_list do if p.state ~= "working" then idle_n += 1 end end
+			local folded = store.parked_folded()
+			add("h:parked", "header", {label = "Parked", value = tostring(#parked_list), folded = folded, idle = idle_n})
+			if not folded then
+				for _, p in parked_list do
+					local chat = known_chat_for_pane(s, p)
+					local item = table.clone(p)
+					if chat then
+						if type(chat.title) == "string" and chat.title ~= "" then item.title = chat.title end
+						if type(chat.agent) == "string" and chat.agent ~= "" then item.agent = chat.agent end
+					end
+					add("parked:" .. tostring(p.pane), "parked", item)
+				end
+			end
+		end
 		if #s.pinned > 0 then
 			add("h:pinned", "header", {label = "Pinned"})
 			for _, chat in s.pinned do add("pin:" .. chat.uid, "session", chat) end
@@ -115,7 +195,7 @@ local reload: (any) -> ()
 local action: (any, string, string?) -> ()
 local function cancel_flow(s: any)
 	s.flow = (s.flow or 0) + 1
-	s.picker = nil; s.menu = nil; s.confirm = nil; s.pending_plan = nil
+	s.picker = nil; s.menu = nil; s.confirm = nil; s.rename = nil; s.pending_plan = nil; s.launch_place = nil
 end
 local function request(s: any, payload: any, cb: (any) -> (), channel: string?, on_err: ((string) -> ())?)
 	local key = channel or "request"
@@ -134,11 +214,12 @@ local function request(s: any, payload: any, cb: (any) -> (), channel: string?, 
 end
 local function mutate(s: any, payload: any, done: ((any) -> ())?, on_err: ((string) -> ())?)
 	if s.busy then return end
-	local conf, p = s.confirm, s.picker
-	local verb = if payload.op == "delete" then "Deleting…" elseif payload.op == "project-remove" then "Removing…" elseif payload.assignment then "Moving…" elseif payload.archived == false then "Restoring…" else "Saving…"
+	local conf, p, ren = s.confirm, s.picker, s.rename
+	local verb = if payload.op == "delete" then "Deleting…" elseif payload.op == "project-remove" then "Removing…" elseif payload.assignment then "Moving…" elseif payload.archived == false then "Restoring…" elseif payload.title ~= nil then "Renaming…" else "Saving…"
 	s.busy = true; s.busy_label = verb
 	if conf then conf.error = nil end
 	if p then p.message = nil; p.busy_label = verb end
+	if ren then ren.error = nil end
 	request(s, payload, function(data)
 		s.busy = false; s.busy_label = nil; s.error = nil
 		if done then done(data) else toast(s, "success", "Changes saved") end
@@ -147,6 +228,7 @@ local function mutate(s: any, payload: any, done: ((any) -> ())?, on_err: ((stri
 		s.busy_label = nil
 		if conf and s.confirm == conf then conf.error = fmt.error(err)
 		elseif p and s.picker == p then p.message = fmt.error(err)
+		elseif ren and s.rename == ren then ren.error = fmt.error(err)
 		else s.error = err; s.error_reload = false end
 		toast(s, "error", "Couldn't complete the change", fmt.error(err))
 		if on_err then on_err(err) end
@@ -207,7 +289,8 @@ local function refresh(s: any)
 		if err then s.error = err; s.error_reload = false; s.cx:render() else s.indexed_at = os.time(); reload(s) end
 	end)
 end
-local function resume(s: any, chat: any)
+-- Resumes `chat`; the window places it beside this sidebar at `place` (main | right | down | tab).
+local function resume(s: any, chat: any, place: string)
 	local r = chat.resume
 	if not r then return end
 	if r.kind == "spawn" then
@@ -216,13 +299,122 @@ local function resume(s: any, chat: any)
 			if result.status ~= 0 then toast(s, "error", "Couldn't resume chat", if result.stderr ~= "" then result.stderr else result.stdout) end
 		end)
 	elseif r.command and r.command ~= "" then
-		s.cx:open("tern-projects://resume?cwd=" .. fmt.pct(chat.cwd or "") .. "&cmd=" .. fmt.pct(r.command))
+		local url = "tern-projects://resume?cwd=" .. fmt.pct(chat.cwd or "") .. "&cmd=" .. fmt.pct(r.command) .. "&place=" .. place
+		-- The uid lets the window show a chat that already runs instead of starting it twice.
+		if type(chat.uid) == "string" and chat.uid ~= "" then url ..= "&uid=" .. fmt.pct(chat.uid) end
+		if type(chat.title) == "string" and chat.title ~= "" then url ..= "&title=" .. fmt.pct(chat.title) end
+		-- Every session id the chat is stored under (an OMP chat omp moved to new files has several): the window
+		-- won't start a second omp on a session another omp process already holds.
+		if chat.agent == "omp" then
+			local sessions = if type(r.sessions) == "table" and #r.sessions > 0 then r.sessions else {chat.id}
+			if type(sessions[1]) == "string" then url ..= "&sessions=" .. fmt.pct(table.concat(sessions, ",")) end
+		end
+		open_window_url(s, url)
 	end
+end
+local function can_fork(chat: any): boolean
+	local r = chat and chat.resume
+	return r ~= nil and r.kind == "tab" and type(r.fork) == "string" and r.fork ~= ""
+end
+-- Forks `chat` into a new independent session at `place` (main | right | down | tab) without stopping or
+-- stealing the original session, then refreshes the index so the new fork appears in the sidebar.
+local function fork_chat(s: any, chat: any, place: string)
+	if not can_fork(chat) then return end
+	local r = chat.resume
+	local cwd = if type(chat.cwd) == "string" and chat.cwd ~= "" then chat.cwd else (r.cwd or "")
+	open_window_url(s, "tern-projects://launch?cwd=" .. fmt.pct(cwd) .. "&cmd=" .. fmt.pct(r.fork) .. "&place=" .. place)
+	toast(s, "info", "Forking chat", chat.title or chat.uid)
+	tern.timer(2200, function() if live(s) then refresh(s) end end)
+	tern.timer(6500, function() if live(s) then refresh(s) end end)
 end
 local function copy(s: any, text: string, what: string)
 	if text == "" then return end
 	s.cx:copy(text)
 	toast(s, "success", "Copied " .. what)
+end
+
+-- Sidebar ------------------------------------------------------------------------------------
+-- A block can't size its own pane: the panel asks the window (`tern-projects://sidebar`), which resizes it
+-- and answers with a `sidebar-state` event.
+
+-- Asks the window for `state` (collapse | expand | fit), one request at a time. Only a width Tern reported
+-- goes along: `cx.cols` is a placeholder until the first resize, which a block restored by a plugin reload
+-- doesn't get until its pane changes size; without one the window nudges the pane to make Tern report it.
+local function request_sidebar(s: any, state: string)
+	if s.sizing then return end
+	if state ~= s.sizing_state then s.sizing_tries = 0 end
+	s.sizing_state = state
+	local token = {}
+	s.sizing = token
+	open_window_url(s, "tern-projects://sidebar?state=" .. state .. "&pane=" .. tostring(s.cx.pane) .. (if s.cols then "&cols=" .. tostring(math.floor(s.cols)) else "") .. (if s.collapsed then "&rail=1" else ""))
+	-- The window answers at once; a request it ignored (the panel lost focus) must not block the next one.
+	tern.timer(1000, function() if s.sizing == token then s.sizing, s.checking = nil, false end end)
+end
+-- Records the width of this sidebar's tab from its own settled width and the share of the tab it takes, sent
+-- with the window's sizing answer; the window uses it to dock a sidebar straight at its width. The share is
+-- spent here: after the user drags the divider it would no longer match.
+local function measure_tab(s: any)
+	local share = s.share
+	s.share = nil
+	if not s.cols or type(share) ~= "number" or share <= 0.02 or share >= 0.98 then return end
+	local total = math.floor(s.cols / share + 0.5)
+	local known = store.tab_cols()
+	if known == nil or math.abs(known - total) > 1 then store.set(store.TAB_COLS_KEY, total) end
+end
+-- After a sizing answer, checks the width once resizing pauses: Tern animates divider moves, so a width read
+-- mid-animation is no basis for another request. A `cells` delta does not land 1:1 on the cols this pane
+-- reports either, so one request can miss its target; re-request with the settled width (bounded, stops if
+-- stuck). `resize` re-arms the check while it is pending.
+local function check_width_soon(s: any)
+	s.checking = true
+	s.check_gen = (s.check_gen or 0) + 1
+	local gen = s.check_gen
+	tern.timer(250, function()
+		if s.check_gen ~= gen or not live(s) then return end
+		-- An unanswered request, or a width Tern hasn't reported yet: the answer or `resize` re-arms the check.
+		if s.sizing or not s.cols then return end
+		local desired = if s.collapsed then store.COLLAPSED else store.width()
+		if math.abs(s.cols - desired) <= 2 or s.cols == s.sizing_last or (s.sizing_tries or 0) >= 4 then
+			s.checking, s.sizing_tries, s.sizing_last = false, 0, nil
+			-- Only an expanded width measures the tab: each pane loses a few cells to padding, which skews the
+			-- estimate at the rail's width but not near the expanded one the window snaps to.
+			if not s.collapsed and math.abs(s.cols - desired) <= 2 then measure_tab(s) end
+			return
+		end
+		s.sizing_tries = (s.sizing_tries or 0) + 1
+		s.sizing_last = s.cols
+		request_sidebar(s, "fit")
+	end)
+end
+-- A new or returning sidebar fits itself to the remembered width (or the rail's) once its own width settles;
+-- until then its widths are layout transients, not the user's choice.
+local function fit_soon(s: any)
+	s.fitted = false
+	s.fit_gen = (s.fit_gen or 0) + 1
+	local gen = s.fit_gen
+	tern.timer(400, function()
+		if s.fit_gen ~= gen or not live(s) then return end
+		s.fitted = true
+		s.sizing_tries, s.sizing_last = 0, nil
+		request_sidebar(s, "fit")
+	end)
+end
+-- Remembers the expanded width the user settles on, once resizing pauses. Sizing lands within two cells of
+-- its target (see check_width_soon); that slack is not a new choice, or the width would creep. Widths while
+-- a fit or its check runs are the plugin's own, not the user's.
+local function remember_width(s: any)
+	s.width_gen = (s.width_gen or 0) + 1
+	local gen = s.width_gen
+	tern.timer(300, function()
+		local cols = s.cols
+		if s.width_gen ~= gen or not s.fitted or s.checking or s.collapsed or s.sizing or not cols or cols < store.MIN_WIDTH or not live(s) then return end
+		if math.abs(store.width() - cols) > 2 then store.set(store.WIDTH_KEY, cols) end
+	end)
+end
+-- Folds or unfolds a project row; the unfolded set survives restarts.
+local function set_expanded(s: any, key: string, open: boolean)
+	s.expanded[key] = if open then true else nil
+	store.set(store.EXPANDED_KEY, s.expanded)
 end
 
 -- Project editor -------------------------------------------------------------------------
@@ -376,7 +568,7 @@ local function editor_intent(s: any, intent: string?, value: string?)
 			if err then d.error = fmt.error(err) else
 				s.editor = nil; s.view = "mine"; s.mode = "projects"
 				local p = data and data.project
-				if p then local key = "project:" .. tostring(p.id); s.sel = key; s.expanded[key] = true end
+				if p then local key = "project:" .. tostring(p.id); s.sel = key; set_expanded(s, key, true) end
 				toast(s, "success", if d.id then "Saved " .. d.name.text else "Created " .. d.name.text)
 				s.cx:frame({{"focus", NULL}})
 				reload(s)
@@ -395,6 +587,7 @@ end
 local function open_picker(s: any, spec: any)
 	s.menu = nil; s.confirm = nil
 	s.picker = picker.new(spec)
+	if s.collapsed then request_sidebar(s, "expand") end
 	s.cx:frame({{"focus", NULL}})
 end
 local function project_items(projects: any, current: string?): {any}
@@ -525,7 +718,7 @@ end
 local function launch_route(s: any, plan: any)
 	if type(plan.cwd) ~= "string" or type(plan.command) ~= "string" or plan.command == "" then s.error = "The launch plan was incomplete."; return end
 	s.picker = nil; s.confirm = nil
-	s.cx:open("tern-projects://launch?cwd=" .. fmt.pct(plan.cwd) .. "&cmd=" .. fmt.pct(plan.command))
+	open_window_url(s, "tern-projects://launch?cwd=" .. fmt.pct(plan.cwd) .. "&cmd=" .. fmt.pct(plan.command) .. "&place=" .. (s.launch_place or "main"))
 	toast(s, "info", "Starting " .. fmt.agent_label(s.launch_harness or ""), "In " .. fmt.path(plan.cwd))
 end
 launch_plan = function(s: any, harness: string)
@@ -576,11 +769,13 @@ launch_plan = function(s: any, harness: string)
 		end
 		s.confirm = {kind = "launch", title = "Start " .. label .. " in " .. (target.label or "this project") .. (if #unsupported > 0 then "'s primary folder only?" else " without unavailable folders?"), body = body,
 			buttons = {{id = "cancel", label = "Cancel"}, {id = "launch-accept", label = "Start in " .. fmt.basename(plan.cwd), variant = "primary"}}, focus = 2, data = plan}
+		if s.collapsed then request_sidebar(s, "expand") end
 	end, "launch", function(err)
 		if target.project_id and string.find(err, "Primary source folder is missing or unreadable", 1, true) then
 			s.picker = nil
 			s.confirm = {kind = "missing-primary", title = "Primary folder is unavailable", body = {c.note(fmt.error(err)), c.note("Edit the project to choose another primary source folder.")},
 				buttons = {{id = "cancel", label = "Cancel"}, {id = "edit-launch-project", label = "Edit project…", variant = "primary"}}, focus = 1, data = target}
+			if s.collapsed then request_sidebar(s, "expand") end
 		elseif s.picker then s.picker.state = "ready"; s.picker.message = fmt.error(err); toast(s, "error", "Couldn't prepare new chat", fmt.error(err))
 		else s.error = err; s.error_reload = false end
 	end)
@@ -614,53 +809,112 @@ start_launch = function(s: any, choose: boolean)
 		harness_picker(s, "launch")
 	end, "harnesses")
 end
-local function new_chat(s: any, key: string?, choose: boolean)
+-- `place` is where the window opens the chat (main | right | down | tab). It carries through the harness
+-- picker, the folder browser and the launch confirmation; any other flow resets it.
+local function new_chat(s: any, key: string?, choose: boolean, place: string)
 	cancel_flow(s)
+	s.launch_place = place
 	if not launch_target_for(s, key) then
 		s.editor = editor.new({name = "", folders = {}})
 		s.editor.launch_only = true; s.editor.choose_harness = choose
 		editor.open_browser(s.editor, nil)
 		s.editor.browser.picker.title = "New chat"
 		s.editor.browser.picker.subtitle = "Choose a starting folder"
+		if s.collapsed then request_sidebar(s, "expand") end
 		browse(s, nil)
-		return
 	end
 	start_launch(s, choose)
 end
 
 -- Menus and confirmations -------------------------------------------------------------------
 
--- One action list per row kind; "-" marks a separator in the keyboard menu (native menus skip it).
+-- One action list per row kind; "-" renders as a separator in both the native right-click menu and the keyboard menu.
 local function menu_entries(s: any, key: string): {string}
 	local row = s.rows[key]
 	if not row then return {} end
-	if row.kind == "session" then
-		return {"resume", "copy-resume-command", "copy-chat-id", "-", if row.ref.pinned then "unpin" else "pin", "move-to-project…", if row.ref.archived then "restore" else "archive", "-", if s.mode == "search" then "search-options" else "panel-options", "-", "delete-permanently…"}
+	if row.kind == "parked" then
+		local out = {"open-in-main", "split-right", "split-down", "open-in-new-tab"}
+		local chat = known_chat_for_pane(s, row.ref)
+		if can_fork(chat) then
+			for _, id in {"-", "fork-chat", "fork-in-split-right", "fork-in-new-tab"} do table.insert(out, id) end
+		end
+		if chat then
+			table.insert(out, "-")
+			table.insert(out, "rename…")
+		end
+		for _, id in {"-", "close-parked-tile", "close-idle-parked", "close-all-parked…"} do table.insert(out, id) end
+		return out
+	elseif row.kind == "session" then
+		local out = {"open-in-main", "split-right", "split-down", "open-in-new-tab"}
+		if can_fork(row.ref) then
+			for _, id in {"-", "fork-chat", "fork-in-split-right", "fork-in-split-down", "fork-in-new-tab"} do
+				table.insert(out, id)
+			end
+		end
+		local lv = live_for_chat(s, row.ref)
+		if lv then
+			table.insert(out, "-")
+			if lv.parked then
+				table.insert(out, "close-parked-tile")
+			else
+				table.insert(out, "park-chat-pane")
+				table.insert(out, "close-chat-pane")
+			end
+		end
+		for _, id in {
+			"-", "rename…", if row.ref.pinned then "unpin" else "pin", "move-to-project…", if row.ref.archived then "restore" else "archive",
+			"-", "copy-resume-command", "copy-chat-id", if s.mode == "search" then "search-options" else "panel-options",
+			"-", "delete-permanently…",
+		} do
+			table.insert(out, id)
+		end
+		return out
 	elseif row.kind == "project" then
-		if s.view == "mine" then return {"new-chat", "new-chat-with…", "-", "edit-project…", "remove-project…", "-", "panel-options"} end
-		return {"new-chat", "new-chat-with…", "-", "save-as-project…", "-", "panel-options"}
+		if s.view == "mine" then return {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "-", "edit-project…", "remove-project…", "-", "panel-options"} end
+		return {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "-", "save-as-project…", "-", "panel-options"}
 	end
 	return {}
 end
 local function menu_ids(s: any, key: string): {string}
 	local out = {}
-	for _, id in menu_entries(s, key) do if id ~= "-" then table.insert(out, id) end end
+	for _, id in menu_entries(s, key) do
+		if id ~= "-" or (#out > 0 and out[#out] ~= "-") then
+			table.insert(out, id)
+		end
+	end
+	if out[#out] == "-" then table.remove(out) end
 	return out
 end
+local MOD_KEY = if tern.runtime.os == "macos" then "cmd" else "ctrl"
 local MENU_META: {[string]: any} = {
-	["resume"] = {label = "Resume", icon = "play", hint = {"enter"}},
+	["open-in-main"] = {label = "Open in Main", icon = "play", hint = {"enter"}},
+	["split-right"] = {label = "Split Right", icon = "split", hint = {MOD_KEY, "enter"}},
+	["split-down"] = {label = "Split Down", icon = "split-down"},
+	["open-in-new-tab"] = {label = "Open in New Tab", icon = "tabs-h", hint = {"shift", MOD_KEY, "enter"}},
+	["fork-chat"] = {label = "Fork chat", icon = "code", hint = {MOD_KEY, "b"}},
+	["fork-in-split-right"] = {label = "Fork in Split Right", icon = "split", hint = {"shift", MOD_KEY, "b"}},
+	["fork-in-split-down"] = {label = "Fork in Split Down", icon = "split-down"},
+	["fork-in-new-tab"] = {label = "Fork in New Tab", icon = "tabs-h"},
+	["park-chat-pane"] = {label = "Park chat pane", icon = "layers"},
+	["close-chat-pane"] = {label = "Close chat pane", icon = "x", tone = "error"},
+	["close-parked-tile"] = {label = "Close parked tile", icon = "x", tone = "error", hint = {"delete"}},
+	["close-idle-parked"] = {label = "Close idle parked", icon = "trash"},
+	["close-all-parked…"] = {label = "Close all parked…", icon = "trash", tone = "error"},
 	["copy-resume-command"] = {label = "Copy resume command", icon = "copy", hint = {"ctrl", "y"}},
 	["copy-chat-id"] = {label = "Copy chat ID", icon = "hash"},
+	["rename…"] = {label = "Rename…", icon = "pen", hint = {"f2"}},
 	["pin"] = {label = "Pin", icon = "pin"},
 	["unpin"] = {label = "Unpin", icon = "pin"},
 	["move-to-project…"] = {label = "Move to project…", icon = "folder-go"},
 	["archive"] = {label = "Archive", icon = "inbox"},
 	["restore"] = {label = "Restore", icon = "undo"},
 	["delete-permanently…"] = {label = "Delete permanently…", icon = "trash", tone = "error"},
-	["new-chat"] = {label = "New chat", icon = "pen", hint = {if tern.runtime.os == "macos" then "cmd" else "ctrl", "n"}},
+	["new-chat"] = {label = "New chat", icon = "pen", hint = {MOD_KEY, "n"}},
+	["new-chat-in-split-right"] = {label = "New chat in Split Right", icon = "split"},
+	["new-chat-in-split-down"] = {label = "New chat in Split Down", icon = "split-down"},
 	["search-options"] = {label = "Search options…", icon = "sliders", hint = {"shift", "f10"}},
 	["panel-options"] = {label = "Panel options…", icon = "sliders"},
-	["new-chat-with…"] = {label = "New chat with…", icon = "sparkle", hint = {"shift", if tern.runtime.os == "macos" then "cmd" else "ctrl", "n"}},
+	["new-chat-with…"] = {label = "New chat with…", icon = "sparkle", hint = {"shift", MOD_KEY, "n"}},
 	["edit-project…"] = {label = "Edit project…", icon = "sliders"},
 	["remove-project…"] = {label = "Remove project…", icon = "trash", tone = "error"},
 	["save-as-project…"] = {label = "Save as project…", icon = "folder-plus"},
@@ -674,15 +928,22 @@ local MENU_META: {[string]: any} = {
 	["sort=updated"] = {label = "Sort: Newest", icon = "clock"},
 	["sort=relevance"] = {label = "Sort: Best match", icon = "sparkle"},
 }
+local function menu_row_kind(kind: string?): boolean
+	return kind == "session" or kind == "project" or kind == "parked"
+end
 local function open_menu(s: any, key: string?)
 	key = key or s.sel
-	if not key or not s.rows[key] or (s.rows[key].kind ~= "session" and s.rows[key].kind ~= "project") then
-		local ids = if s.mode == "search" then {"scope=workspace", "scope=repository", "scope=all", "-", "filter", "filter-project=all", "-", "sort=updated", "sort=relevance"} else {"new-chat", "new-chat-with…", "create", "-", "refresh"}
+	if not key or not s.rows[key] or not menu_row_kind(s.rows[key].kind) then
+		local ids = if s.mode == "search"
+			then {"scope=workspace", "scope=repository", "scope=all", "-", "filter", "filter-project=all", "-", "sort=updated", "sort=relevance"}
+			elseif #(s.parked or {}) > 0
+			then {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "create", "-", "close-idle-parked", "close-all-parked…", "-", "refresh"}
+			else {"new-chat", "new-chat-in-split-right", "new-chat-in-split-down", "new-chat-with…", "create", "-", "refresh"}
 		s.menu = {ids = ids, selected = ids[1], title = if s.mode == "search" then "Search options" else "Projects"}
 		return
 	end
 	local row = s.rows[key]
-	if not row or (row.kind ~= "session" and row.kind ~= "project") then return end
+	if not row or not menu_row_kind(row.kind) then return end
 	local ids = menu_entries(s, key)
 	s.picker = nil; s.confirm = nil
 	s.sel = key
@@ -744,12 +1005,117 @@ local function confirm_delete(s: any, chat: any)
 	end)
 end
 
+local function open_rename(s: any, chat: any)
+	if not chat or type(chat.uid) ~= "string" or chat.uid == "" then return end
+	cancel_flow(s)
+	local current = chat.title or chat.uid
+	s.rename = {
+		uid = chat.uid,
+		title = current,
+		has_custom = chat.custom_title == true,
+		input = tf.new(current),
+		selected_all = current ~= "",
+		attempted = false,
+		touched = false,
+		focus = "title",
+		error = nil,
+	}
+	if s.collapsed then request_sidebar(s, "expand") end
+	s.cx:render()
+	s.cx:frame({{"focus", RENAME_FIELD}})
+end
+local function rename_controls(r: any): {string}
+	local out = {"title"}
+	if r.has_custom then table.insert(out, "reset") end
+	table.insert(out, "cancel")
+	table.insert(out, "save")
+	return out
+end
+local function focus_rename(s: any)
+	local r = s.rename
+	if not r then return end
+	s.cx:frame({{"focus", if r.focus == "title" then RENAME_FIELD else NULL}})
+end
+local function rename_intent(s: any, act: string)
+	local r = s.rename
+	if not r then return end
+	if act == "cancel" then
+		s.rename = nil
+		s.cx:frame({{"focus", NULL}})
+		return
+	end
+	if s.busy then return end
+	if act == "reset" then
+		mutate(s, {op = "chat-update", uid = r.uid, title = NULL}, function()
+			s.rename = nil
+			s.cx:frame({{"focus", NULL}})
+			toast(s, "success", "Title reset")
+		end)
+		return
+	end
+	if act == "save" then
+		local trimmed = string.match(r.input.text, "^%s*(.-)%s*$") or ""
+		if trimmed == "" then
+			r.attempted = true
+			r.focus = "title"
+			focus_rename(s)
+			return
+		end
+		if trimmed == r.title then
+			s.rename = nil
+			s.cx:frame({{"focus", NULL}})
+			return
+		end
+		mutate(s, {op = "chat-update", uid = r.uid, title = trimmed}, function()
+			s.rename = nil
+			s.cx:frame({{"focus", NULL}})
+			toast(s, "success", "Renamed chat")
+		end)
+	end
+end
+local function rename_key(s: any, k: Key): boolean
+	local r = s.rename
+	local name = k.name
+	if name == "escape" then rename_intent(s, "cancel"); return true end
+	if name == "enter" and (k.meta or k.ctrl) then rename_intent(s, "save"); return true end
+	if name == "tab" then
+		local controls = rename_controls(r)
+		local idx = table.find(controls, r.focus) or 1
+		r.focus = controls[(idx - 1 + (if k.shift then -1 else 1)) % #controls + 1]
+		r.selected_all = false
+		focus_rename(s)
+		return true
+	end
+	if r.focus == "title" then
+		if name == "enter" then rename_intent(s, "save"); return true end
+		local before = r.input.text
+		local handled, all = input.key(r.input, r.selected_all, k, tern.runtime.os)
+		r.selected_all = all
+		if r.input.text ~= before then r.touched = true; r.error = nil end
+		return handled or true
+	end
+	if name == "enter" or name == "space" or k.text == " " then
+		rename_intent(s, r.focus)
+		return true
+	end
+	if name == "left" or name == "right" or name == "up" or name == "down" then
+		local controls = rename_controls(r)
+		local idx = table.find(controls, r.focus) or 1
+		r.focus = controls[math.clamp(idx + (if name == "left" or name == "up" then -1 else 1), 1, #controls)]
+		focus_rename(s)
+		return true
+	end
+	return true
+end
+
 -- Row activation ---------------------------------------------------------------------------
 
 local function find_chat(s: any, key: string): any
 	local row = s.rows[key]
 	if row and row.kind == "session" then return row.ref end
 	for _, chat in s.archived or {} do if chat.uid == key then return chat end end
+	-- The collapsed tile names recent chats by uid.
+	for _, chat in s.recent or {} do if chat.uid == key then return chat end end
 	return nil
 end
 local function enter_search(s: any)
@@ -767,11 +1133,22 @@ local function activate(s: any, key: string?)
 		return
 	end
 	s.sel = key
-	if row.kind == "session" then resume(s, row.ref)
-	elseif row.kind == "project" then s.expanded[key] = not s.expanded[key]; rebuild(s)
+	-- An opened chat is in view now; its card would only need an Esc. Tern pairs the first two clicks of a quick
+	-- click-then-double-click into the double-click, so the third arrives as a lone `select` right after this; it
+	-- must not reselect the chat and bring its card back.
+	if row.kind == "session" then
+		resume(s, row.ref, "main"); s.sel = nil
+		just_opened = key
+		tern.timer(600, function() if just_opened == key then just_opened = nil end end)
+	elseif row.kind == "parked" then
+		open_window_url(s, "tern-projects://pane?op=show&pane=" .. tostring(row.ref.pane) .. "&place=main")
+		s.sel = nil
+		just_opened = key
+		tern.timer(600, function() if just_opened == key then just_opened = nil end end)
+	elseif row.kind == "project" then set_expanded(s, key :: string, not s.expanded[key]); rebuild(s)
 	elseif row.kind == "more" then s.more[row.parent] = true; rebuild(s)
 	elseif row.kind == "fewer" then s.more[row.parent] = nil; rebuild(s)
-	elseif row.kind == "start" then new_chat(s, row.parent, false)
+	elseif row.kind == "start" then new_chat(s, row.parent, false, "main")
 	elseif row.kind == "older" then
 		local p = row.ref
 		s.search_cwd = nil; s.project_label = nil
@@ -799,7 +1176,7 @@ end
 
 -- Actions ------------------------------------------------------------------------------------
 
-local SETTINGS = {"default", "icons", "archived", "refresh"}
+local SETTINGS = {"default", "icons", "auto-tabs", "card", "collapse-style", "archived", "refresh"}
 local function hide_busy(s: any)
 	cancel_flow(s)
 	s.editor = nil; s.archived_picker = nil
@@ -907,12 +1284,67 @@ local function confirm_action(s: any, id: string)
 	elseif id == "archive-instead" then
 		local chat = conf.chat
 		if chat then mutate(s, {op = "chat-update", uid = chat.uid, archived = true}, function() s.confirm = nil; toast(s, "success", "Archived", "Restore it from Settings → Archived chats.") end) end
+	elseif id == "close-pane-confirm" then
+		local pane_id = conf.data and conf.data.pane
+		s.confirm = nil
+		if type(pane_id) == "number" then open_window_url(s, "tern-projects://pane?op=close&pane=" .. tostring(pane_id)) end
+	elseif id == "close-idle-confirm" then
+		s.confirm = nil
+		open_window_url(s, "tern-projects://pane?op=close-idle-parked")
+	elseif id == "close-all-confirm" then
+		s.confirm = nil
+		open_window_url(s, "tern-projects://pane?op=close-all-parked")
 	end
 end
+local function close_pane_or_confirm(s: any, pane_id: number, label: string, state: string?)
+	s.menu = nil; s.picker = nil
+	if state == "working" then
+		s.confirm = {
+			kind = "close-pane",
+			title = "Close working chat?",
+			body = {c.note("“" .. label .. "” is still working. Closing its pane stops the running process.")},
+			buttons = {{id = "cancel", label = "Cancel"}, {id = "close-pane-confirm", label = "Close anyway", variant = "danger"}},
+			focus = 1,
+			data = {pane = pane_id},
+		}
+		return
+	end
+	if s.sel == "parked:" .. tostring(pane_id) then s.sel = nil end
+	open_window_url(s, "tern-projects://pane?op=close&pane=" .. tostring(pane_id))
+end
+local function close_all_parked_or_confirm(s: any)
+	s.menu = nil; s.picker = nil
+	local working = 0
+	for _, p in s.parked or {} do if p.state == "working" then working += 1 end end
+	if working > 0 then
+		s.confirm = {
+			kind = "close-all-parked",
+			title = "Close all parked tiles?",
+			body = {c.note(fmt.plural(working, "parked chat") .. " still working. “Close idle only” keeps working chats alive.")},
+			buttons = {{id = "cancel", label = "Cancel"}, {id = "close-idle-confirm", label = "Close idle only", variant = "primary"}, {id = "close-all-confirm", label = "Close all", variant = "danger"}},
+			focus = 2,
+		}
+		return
+	end
+	open_window_url(s, "tern-projects://pane?op=close-all-parked")
+end
+-- Session actions that open the chat, by where the window places it; "resume" (the dock button) is Open in Main.
+local OPEN_PLACES: {[string]: string} = {resume = "main", ["open-in-main"] = "main", ["split-right"] = "right", ["split-down"] = "down", ["open-in-new-tab"] = "tab"}
+local FORK_PLACES: {[string]: string} = {["fork-chat"] = "main", ["fork-in-split-right"] = "right", ["fork-in-split-down"] = "down", ["fork-in-new-tab"] = "tab"}
+-- New-chat actions by where the new chat opens.
+local NEW_CHAT_PLACES: {[string]: string} = {["new-chat"] = "main", ["new-chat-with…"] = "main", ["new-chat-in-split-right"] = "right", ["new-chat-in-split-down"] = "down"}
 local function chat_action(s: any, act: string, chat: any)
-	if act == "resume" then resume(s, chat)
+	if OPEN_PLACES[act] then resume(s, chat, OPEN_PLACES[act])
+	elseif FORK_PLACES[act] then fork_chat(s, chat, FORK_PLACES[act])
+	elseif act == "park-chat-pane" then
+		local lv = live_for_chat(s, chat)
+		if lv and not lv.parked then open_window_url(s, "tern-projects://pane?op=park&pane=" .. tostring(lv.pane)) end
+	elseif act == "close-chat-pane" or act == "close-parked-tile" then
+		local lv = live_for_chat(s, chat)
+		if lv then close_pane_or_confirm(s, lv.pane, chat.title or chat.uid, lv.state) end
 	elseif act == "copy-resume-command" then copy(s, chat.resume and chat.resume.command or "", "resume command")
 	elseif act == "copy-chat-id" then copy(s, chat.id or chat.uid, "chat ID")
+	elseif act == "rename…" then open_rename(s, chat)
 	elseif act == "pin" or act == "unpin" then
 		mutate(s, {op = "chat-update", uid = chat.uid, pinned = act == "pin"}, function() toast(s, "success", if act == "pin" then "Pinned" else "Unpinned") end)
 	elseif act == "archive" or act == "restore" then
@@ -924,13 +1356,31 @@ local function chat_action(s: any, act: string, chat: any)
 end
 local function row_action(s: any, act: string, key: string)
 	if act == "search-options" or act == "panel-options" then open_menu(s, ""); return end
+	if act == "close-idle-parked" then s.menu = nil; open_window_url(s, "tern-projects://pane?op=close-idle-parked"); return end
+	if act == "close-all-parked…" then close_all_parked_or_confirm(s); return end
 	local row = s.rows[key]
 	if not row then return end
 	s.menu = nil
+	if row.kind == "parked" then
+		local p = row.ref
+		if OPEN_PLACES[act] then
+			open_window_url(s, "tern-projects://pane?op=show&pane=" .. tostring(p.pane) .. "&place=" .. OPEN_PLACES[act])
+			s.sel = nil
+		elseif FORK_PLACES[act] then
+			local chat = known_chat_for_pane(s, p)
+			if chat then fork_chat(s, chat, FORK_PLACES[act]); s.sel = nil end
+		elseif act == "rename…" then
+			local chat = known_chat_for_pane(s, p)
+			if chat then open_rename(s, chat) end
+		elseif act == "close-parked-tile" or act == "close-chat-pane" then
+			close_pane_or_confirm(s, p.pane, p.title or "Pane", p.state)
+		end
+		return
+	end
 	if row.kind == "session" then chat_action(s, act, row.ref); return end
 	if row.kind ~= "project" then return end
 	local p = row.ref
-	if act == "new-chat" or act == "new-chat-with…" then new_chat(s, key, act == "new-chat-with…")
+	if NEW_CHAT_PLACES[act] then new_chat(s, key, act == "new-chat-with…", NEW_CHAT_PLACES[act])
 	elseif act == "edit-project…" then open_editor(s, p)
 	elseif act == "save-as-project…" then open_editor(s, {name = project_name(p), folders = {p.root}})
 	elseif act == "remove-project…" then confirm_remove(s, p) end
@@ -947,6 +1397,13 @@ action = function(s: any, act: string, value: string?)
 	elseif act == "create" then open_editor(s, nil)
 	elseif act == "refresh" then refresh(s)
 	elseif act == "reload" then reload(s)
+	elseif act == "toggle-parked-fold" then
+		store.set(store.PARKED_FOLD_KEY, not store.parked_folded())
+		rebuild(s)
+	elseif act == "close-idle-parked" then
+		open_window_url(s, "tern-projects://pane?op=close-idle-parked")
+	elseif act == "close-all-parked…" then
+		close_all_parked_or_confirm(s)
 	elseif act == "search-options" or act == "panel-options" then open_menu(s, "")
 	elseif act == "scope" then s.scope = value; s.search_cwd = nil; s.offset = 0; s.page = 0; reload(s)
 	elseif act == "sort" then
@@ -968,7 +1425,7 @@ action = function(s: any, act: string, value: string?)
 	elseif act == "clear-query" then tf.set(s.query, ""); s.query_all = false; search_changed(s)
 	elseif act == "activate" then activate(s, fmt.unpct(value or ""))
 	elseif act == "actions" then open_menu(s, if value then fmt.unpct(value) else nil)
-	elseif act == "new-chat" or act == "new-chat-with…" then new_chat(s, if value then fmt.unpct(value) else nil, act == "new-chat-with…")
+	elseif NEW_CHAT_PLACES[act] then new_chat(s, if value then fmt.unpct(value) else nil, act == "new-chat-with…", NEW_CHAT_PLACES[act])
 	elseif act == "default-picker" then s.settings_focus = "default"; harness_picker(s, "default")
 	elseif act == "icon-style" then
 		s.settings_focus = "icons"
@@ -978,16 +1435,42 @@ action = function(s: any, act: string, value: string?)
 			s.settings.icon_style = style
 			mutate(s, {op = "settings-update", icon_style = style}, nil, function() s.settings.icon_style = previous end)
 		end
+	elseif act == "auto-tabs" then
+		s.settings_focus = "auto-tabs"
+		local on = if value == "on" then true elseif value == "off" then false else not store.auto_tabs()
+		store.set(store.AUTO_KEY, on)
+	elseif act == "card" then
+		s.settings_focus = "card"
+		local on = if value == "on" then true elseif value == "off" then false else not store.card()
+		store.set(store.CARD_KEY, on)
+	elseif act == "collapse-style" then
+		s.settings_focus = "collapse-style"
+		local order = {"hide", "rail", "tile"}
+		local style = value
+		if style ~= "hide" and style ~= "rail" and style ~= "tile" then
+			local i = table.find(order, store.collapse_style()) or 1
+			style = order[i % #order + 1]
+		end
+		store.set(store.STYLE_KEY, style)
 	elseif act == "archived" then s.settings_focus = "archived"; archived_picker(s)
-	elseif act == "resume" or act == "copy-resume-command" or act == "copy-chat-id" then
-		-- Native menus name the clicked row; the dock and shortcuts act on the selection.
-		local chat = find_chat(s, if value then fmt.unpct(value) else (s.sel or ""))
-		if chat then chat_action(s, act, chat) end
-	elseif act == "edit-selected" then
-		local row = s.rows[s.sel or ""]
-		if row and row.kind == "project" then row_action(s, if s.view == "mine" then "edit-project…" else "save-as-project…", s.sel) end
-	elseif value and s.rows[fmt.unpct(value)] then
-		row_action(s, act, fmt.unpct(value))
+	else
+		local target_key = if value then fmt.unpct(value) else (s.sel or "")
+		local target_row = s.rows[target_key]
+		if target_row and target_row.kind == "parked" then
+			row_action(s, act, target_key)
+		elseif OPEN_PLACES[act] or FORK_PLACES[act] or act == "rename…" or act == "copy-resume-command" or act == "copy-chat-id" or act == "park-chat-pane" or act == "close-chat-pane" or act == "close-parked-tile" then
+			-- Native menus name the clicked row; the dock and shortcuts act on the selection.
+			local chat = find_chat(s, target_key)
+			if chat then
+				chat_action(s, act, chat)
+				-- An opened or forked chat is in view now; its card would only need an Esc.
+				if OPEN_PLACES[act] or FORK_PLACES[act] then s.sel = nil end
+			end
+		elseif act == "edit-selected" then
+			if target_row and target_row.kind == "project" then row_action(s, if s.view == "mine" then "edit-project…" else "save-as-project…", target_key) end
+		elseif target_row then
+			row_action(s, act, target_key)
+		end
 	end
 end
 local function menu_activate(s: any, id: string)
@@ -1025,9 +1508,20 @@ local function settings_key(s: any, k: Key): boolean
 	end
 	local f = s.settings_focus
 	if f == "icons" and (name == "left" or name == "right") then action(s, "icon-style", if name == "left" then "color" else "monochrome"); return true end
+	if f == "auto-tabs" and (name == "left" or name == "right") then action(s, "auto-tabs", if name == "left" then "on" else "off"); return true end
+	if f == "card" and (name == "left" or name == "right") then action(s, "card", if name == "left" then "on" else "off"); return true end
+	if f == "collapse-style" and (name == "left" or name == "right") then
+		local order = {"hide", "rail", "tile"}
+		local i = table.find(order, store.collapse_style()) or 1
+		action(s, "collapse-style", order[math.clamp(i + (if name == "left" then -1 else 1), 1, #order)])
+		return true
+	end
 	if (name == "enter" or name == "space") and f then
 		if f == "default" then action(s, "default-picker", nil)
 		elseif f == "icons" then action(s, "icon-style", nil)
+		elseif f == "auto-tabs" then action(s, "auto-tabs", nil)
+		elseif f == "card" then action(s, "card", nil)
+		elseif f == "collapse-style" then action(s, "collapse-style", nil)
 		elseif f == "archived" then action(s, "archived", nil)
 		elseif f == "refresh" then refresh(s) end
 		return true
@@ -1072,6 +1566,7 @@ local function nav_view(s: any, narrow: boolean): any
 			{id = "search", label = "Search", icon = "search", title = "Search chats (/)"},
 			{id = "settings", label = "Settings", icon = "gear", title = "Settings"},
 		}, s.mode, "mode", {class = "tp-nav", icons_only = narrow}),
+		c.icon_button("sidebar", "sidebar=collapse", (({rail = "Collapse to icons", tile = "Collapse to a tile"}) :: any)[store.collapse_style()] or "Hide sidebar", {key = "collapse", variant = "ghost", size = "sm"}),
 	})
 end
 local function launch_hint(s: any): string
@@ -1154,16 +1649,55 @@ local function list_view(s: any): any
 				table.insert(items, c.empty(card_key, cref.icon, cref.title, cref.body, buttons))
 			end
 		elseif row.kind == "header" then
-			table.insert(items, c.header(key, r.label, r.value, if key == "h:projects" then c.icon_button("plus", "create", "Create project", {variant = "ghost", size = "xs", key = "create"}) else nil))
+			local btn: any = nil
+			if key == "h:projects" then
+				btn = c.icon_button("plus", "create", "Create project", {variant = "ghost", size = "xs", key = "create"})
+			elseif key == "h:parked" then
+				btn = ui.el("div", {class = "tp-sec-a"}, {
+					c.icon_button("chev", "toggle-parked-fold", if r.folded then "Show parked tiles" else "Fold parked tiles", {variant = "ghost", size = "xs", key = "fold-parked", class = if r.folded then "fold" else "fold open"}),
+					c.icon_button("x", "close-idle-parked", if (r.idle or 0) > 0 then "Close " .. tostring(r.idle) .. " idle parked tile" .. (if r.idle == 1 then "" else "s") else "All parked tiles are working", {variant = "ghost", size = "xs", key = "clear-parked", disabled = (r.idle or 0) == 0}),
+				})
+			end
+			table.insert(items, c.header(key, r.label, r.value, btn))
 		else
 			local props: any = {key = key}
 			local child = row.parent ~= nil
-			if row.kind == "session" then
+			if row.kind == "parked" then
+				props.icon = if r.agent then fmt.agent_icon(r.agent) elseif r.kind == "file" then "file" elseif r.kind == "git" then "code" elseif r.kind == "browser" then "globe" else "terminal"
+				props.tone = if r.agent then fmt.agent_tone(r.agent, s.settings.icon_style) else nil
+				props.label = r.title or "Pane"
+				if r.state == "working" then
+					props.value = {ui.span("● Working", "accent")}
+				elseif r.state == "waiting" then
+					props.value = {ui.span("● Waiting", "warning")}
+				elseif r.state == "exited" then
+					props.value = {ui.span("Exited", "muted")}
+				elseif type(r.cwd) == "string" and r.cwd ~= "" then
+					local base = fmt.basename(r.cwd)
+					if string.lower(base) ~= string.lower(r.title or "") then
+						props.value = base
+					end
+				end
+				local status_t = if r.state == "working" then "Working" elseif r.state == "waiting" then "Waiting" elseif r.state == "exited" then "Exited" else "Parked"
+				props.title = (r.title or "Pane") .. (if type(r.cwd) == "string" and r.cwd ~= "" then " · " .. fmt.path(r.cwd) else "") .. " · " .. status_t .. " (right-click to close)"
+				props.role = "tern-projects.chat"
+				props.actions = {menu = menu_ids(s, key)}
+			elseif row.kind == "session" then
+				local lv = live_for_chat(s, r)
 				props.icon = fmt.agent_icon(r.agent or "")
 				props.tone = fmt.agent_tone(r.agent, s.settings.icon_style)
 				props.label = r.title or r.uid
-				props.value = if r.pinned then {ui.span("\u{f08d} ", "icon"), ui.span(fmt.age(r.updated_ms or 0), "muted")} else fmt.age(r.updated_ms or 0)
-				props.title = fmt.agent_label(r.agent or "") .. " · " .. fmt.path(r.cwd or "") .. (if r.pinned then " · Pinned" else "")
+				local spans: {any} = {}
+				if lv then
+					local dot = if lv.parked then (if lv.state == "working" then "◐ " else "○ ") else "● "
+					local dtone = if lv.state == "working" then "accent" elseif lv.state == "waiting" then "warning" elseif lv.parked then "muted" else "success"
+					table.insert(spans, ui.span(dot, dtone))
+				end
+				if r.pinned then table.insert(spans, ui.span("\u{f08d} ", "icon")) end
+				table.insert(spans, ui.span(fmt.age(r.updated_ms or 0), "muted"))
+				props.value = if #spans > 1 then spans else fmt.age(r.updated_ms or 0)
+				local live_note = if not lv then "" elseif lv.parked then " · Parked in deck (right-click to close)" elseif lv.state == "working" then " · Open (working)" else " · Open in tab"
+				props.title = fmt.agent_label(r.agent or "") .. " · " .. fmt.path(r.cwd or "") .. (if r.pinned then " · Pinned" else "") .. live_note
 				local snippet = s.mode == "search" and s.query.text ~= "" and type(r.snippet) == "string" and r.snippet ~= ""
 				if snippet then
 					props.detail = fmt.snippet_spans(r.snippet, r.title)
@@ -1171,9 +1705,7 @@ local function list_view(s: any): any
 				else
 					props.role = if child then "tern-projects.child" else "tern-projects.chat"
 				end
-				local menu = {}
-				for _, id in menu_ids(s, key) do table.insert(menu, id) end
-				props.actions = {menu = menu}
+				props.actions = {menu = menu_ids(s, key)}
 			elseif row.kind == "project" then
 				local open = s.expanded[key] == true
 				props.icon = if s.view == "mine" then (r.icon or "folder") else (if open then "folder-open" else "folder")
@@ -1237,6 +1769,13 @@ local function setting_row(key: string, focused: boolean, label: string, desc: s
 		ui.el("div", {class = "tp-set-c"}, {control}),
 	})
 end
+-- What Collapse does under the current Settings choice.
+local function collapse_hint(): string
+	local style = store.collapse_style()
+	if style == "rail" then return "A narrow icon rail; Tern keeps it at least a tenth of the window wide." end
+	if style == "tile" then return "A card over the chat's top-left corner: Expand, the latest chats and New chat." end
+	return "Hidden; " .. (if tern.runtime.os == "macos" then "Cmd+Alt+S" else "Ctrl+Alt+S") .. " or the status bar's Projects button shows it again."
+end
 local function settings_view(s: any): any
 	local f = s.settings_focus
 	local default = s.settings.default_harness
@@ -1244,7 +1783,7 @@ local function settings_view(s: any): any
 	local index_desc = if s.indexing then "Indexing chat history…" elseif s.indexed_at then "Updated " .. fmt.ago(s.indexed_at * 1000) .. " · every 2 min" else "Updated automatically · every 2 min"
 	local archived = s.archived_total
 	local mod = if tern.runtime.os == "macos" then "cmd" else "ctrl"
-	local shortcuts = {
+	local shortcuts: {{any}} = {
 		{"Open Projects", if tern.runtime.os == "macos" then {"alt", "cmd", "s"} else {"ctrl", "alt", "s"}},
 		{"Search everywhere", if tern.runtime.os == "macos" then {"ctrl", "alt", "cmd", "s"} else {"ctrl", "alt", "shift", "s"}},
 		{"Search from Projects / Settings", {"/"}},
@@ -1253,7 +1792,12 @@ local function settings_view(s: any): any
 		{"Move selection", {"up", "down"}},
 		{"Move 10 rows / cross result pages", {"page_up", "page_down"}},
 		{"Expand / collapse project", {"left", "right"}},
-		{"Resume chat / toggle project", {"enter"}},
+		{"Open chat in main area / toggle project", {"enter"}},
+		{"Open chat in Split Right", {mod, "enter"}},
+		{"Open chat in New Tab", {"shift", mod, "enter"}},
+		{"Fork chat / Fork in Split Right", {mod, "b"}},
+		{"Rename chat", {"f2"}},
+		{"Close selected parked tile", {"delete"}},
 		{"Actions / search or panel options", {"shift", "f10"}},
 		{"New chat", {mod, "n"}},
 		{"New chat with…", {"shift", mod, "n"}},
@@ -1276,6 +1820,19 @@ local function settings_view(s: any): any
 			setting_row("icons", f == "icons", "Harness icons", "Tints each harness glyph.",
 				c.seg({{id = "color", label = "Color"}, {id = "monochrome", label = if (s.cols or 44) < 48 then "Neutral" else "Monochrome", title = "Monochrome"}}, s.settings.icon_style or "color", "icon-style", {size = "sm", focused = if f == "icons" then s.settings.icon_style or "color" else nil})),
 		}),
+		ui.el("div", {class = "tp-sec-t", text = "Sidebar"}),
+		ui.el("div", {class = "tp-card"}, {
+			setting_row("auto-tabs", f == "auto-tabs", "Open in new tabs", "Every new tab starts with this sidebar on its left.",
+				c.seg({{id = "on", label = "On"}, {id = "off", label = "Off"}}, if store.auto_tabs() then "on" else "off", "auto-tabs", {size = "sm", focused = if f == "auto-tabs" then (if store.auto_tabs() then "on" else "off") else nil})),
+			setting_row("card", f == "card", "Selection card", "Clicking a chat or folder shows its card at the bottom. Off: a click only selects; right-click has the same actions.",
+				c.seg({{id = "on", label = "On"}, {id = "off", label = "Off"}}, if store.card() then "on" else "off", "card", {size = "sm", focused = if f == "card" then (if store.card() then "on" else "off") else nil})),
+			setting_row("collapse-style", f == "collapse-style", "When collapsed", collapse_hint(),
+				c.seg({
+					{id = "hide", label = "Hide"},
+					{id = "rail", label = if (s.cols or 44) < 48 then "Icons" else "Icon rail", title = "Icon rail"},
+					{id = "tile", label = "Tile", title = "A card over the chat's top-left corner"},
+				}, store.collapse_style(), "collapse-style", {size = "sm", focused = if f == "collapse-style" then store.collapse_style() else nil})),
+		}),
 		ui.el("div", {class = "tp-sec-t", text = "Chats"}),
 		ui.el("div", {class = "tp-card"}, {
 			setting_row("archived", f == "archived", "Archived chats", if archived and archived > 0 then fmt.plural(archived, "chat") .. " hidden from lists and search." else "Archived chats are hidden from lists and search.",
@@ -1288,12 +1845,27 @@ local function settings_view(s: any): any
 	})
 end
 local function dock_view(s: any): any?
+	if not store.card() then return nil end
 	local row = s.rows[s.sel or ""]
-	if not row or (row.kind ~= "session" and row.kind ~= "project") then return nil end
+	if not row or not menu_row_kind(row.kind) then return nil end
 	local r = row.ref
 	local kids: {any} = {}
 	local narrow = (s.cols or 44) < 48
-	if row.kind == "session" then
+	if row.kind == "parked" then
+		local icon = if r.agent then fmt.agent_icon(r.agent) elseif r.kind == "file" then "file" else "terminal"
+		table.insert(kids, ui.el("div", {class = "tp-dock-h"}, {ui.node("icon", {name = icon}), ui.node("text", {text = r.title or "Pane", lines = 1, grow = 1, role = "tern-projects.dock-title"})}))
+		local status_t = if r.state == "working" then "Working in deck" elseif r.state == "waiting" then "Waiting in deck" elseif r.state == "exited" then "Exited in deck" else "Parked in deck"
+		table.insert(kids, ui.node("text", {text = status_t, truncate = "end", role = "tern-projects.dock-meta"}))
+		if type(r.cwd) == "string" and r.cwd ~= "" then
+			table.insert(kids, ui.el("div", {class = "tp-dock-where"}, {ui.node("text", {text = display_path(r.cwd, math.max(18, (s.cols or 44) - 12)), truncate = "start", grow = 1, title = r.cwd, role = "tern-projects.dock-path"})}))
+		end
+		table.insert(kids, ui.el("div", {class = "tp-dock-a"}, {
+			c.button("Open", "open-in-main=" .. fmt.pct(s.sel), {variant = "primary", size = "sm", icon = "play", title = "Open in the main area (⏎)"}),
+			c.button("Close tile", "close-parked-tile=" .. fmt.pct(s.sel), {variant = "danger", size = "sm", icon = "x", title = "Close without opening (Del)"}),
+			c.icon_button("more", "actions", "More actions (⇧F10)", {size = "sm"}),
+		}))
+	elseif row.kind == "session" then
+		local lv = live_for_chat(s, r)
 		local meta = fmt.agent_label(r.agent or "") .. " · " .. fmt.plural(r.messages or 0, "message") .. " · " .. fmt.age(r.updated_ms or 0)
 		local heading = {harness_icon(s, r.agent or ""), ui.node("text", {text = r.title or r.uid, lines = if narrow then 1 else 2, grow = 1, role = "tern-projects.dock-title"})}
 		if r.pinned then table.insert(heading, ui.el("span", {class = "tp-pin", title = "Pinned", aria = "Pinned"}, {ui.node("icon", {name = "pin"})})) end
@@ -1305,11 +1877,16 @@ local function dock_view(s: any): any?
 		if type(r.last_assistant) == "string" and r.last_assistant ~= "" then
 			table.insert(kids, ui.node("text", {text = r.last_assistant, lines = 2, role = "tern-projects.dock-preview"}))
 		end
-		table.insert(kids, ui.el("div", {class = "tp-dock-a"}, {
-			c.button("Resume", "resume", {variant = "primary", size = "sm", icon = "play", title = "Resume (⏎)"}),
-			if narrow then c.icon_button("copy", "copy-resume-command", "Copy resume command (Ctrl+Y)", {size = "sm"}) else c.button("Copy command", "copy-resume-command", {size = "sm", icon = "copy", title = "Copy resume command (Ctrl+Y)"}),
-			c.icon_button("more", "actions", "More actions (⇧F10)", {size = "sm"}),
-		}))
+		local acts: {any} = {
+			c.button(if lv and not lv.parked then "Focus" else "Resume", "resume", {variant = "primary", size = "sm", icon = "play", title = "Open in the main area (⏎)"}),
+		}
+		if lv then
+			table.insert(acts, c.button(if narrow then "Close" else (if lv.parked then "Close tile" else "Close pane"), if lv.parked then "close-parked-tile" else "close-chat-pane", {size = "sm", icon = "x"}))
+		else
+			table.insert(acts, if narrow then c.icon_button("copy", "copy-resume-command", "Copy resume command (Ctrl+Y)", {size = "sm"}) else c.button("Copy command", "copy-resume-command", {size = "sm", icon = "copy", title = "Copy resume command (Ctrl+Y)"}))
+		end
+		table.insert(acts, c.icon_button("more", "actions", "More actions (⇧F10)", {size = "sm"}))
+		table.insert(kids, ui.el("div", {class = "tp-dock-a"}, acts))
 	else
 		local mine = s.view == "mine"
 		local folders = if mine then (r.folders or {}) else {r.root}
@@ -1370,12 +1947,42 @@ local function menu_view(s: any): any
 		ui.node("list", {key = "list", selected = "layer.menu.list." .. m.selected}, kids),
 	})
 end
+
+local function rename_view(s: any): any
+	local r = s.rename
+	local f = r.focus
+	local blank = not string.match(r.input.text, "%S")
+	local body: {any} = {
+		c.label("Title"),
+		ui.node("input", {
+			key = "title",
+			text = r.input.text,
+			cursor = tf.utf16(r.input),
+			anchor = if r.selected_all then 0 else nil,
+			placeholder = "Enter a chat title",
+			aria = "Chat title",
+			role = if (r.attempted or r.touched) and blank then "tern-projects.field-invalid" else "tern-projects.field",
+		}),
+	}
+	if (r.attempted or r.touched) and blank then table.insert(body, c.note("Enter a chat title.", "error")) end
+	if r.error then table.insert(body, c.banner("rename-error", "error", "warn", r.error)) end
+	local leading = if r.has_custom then {c.button("Reset original", "rename=reset", {variant = "ghost", focused = f == "reset", disabled = s.busy})} else nil
+	local footer = c.footer({
+		c.button("Cancel", "rename=cancel", {variant = "ghost", focused = f == "cancel", disabled = s.busy}),
+		c.button(if s.busy then "Renaming…" else "Save", "rename=save", {variant = "primary", focused = f == "save", disabled = s.busy or blank}),
+	}, leading)
+	return ui.node("overlay", {key = "rename", modal = true, size = "sm", head = "Rename chat", role = "tern-projects.dialog"}, {
+		ui.el("div", {key = "form", class = "tp-form"}, body),
+		footer,
+	})
+end
 local function layer_view(s: any): any?
 	if s.editor then
 		local d = s.editor
 		if d.browser then return ui.col({picker.view(d.browser.picker, s.busy)}) end
 		return ui.col({editor.view(d, s.busy)})
 	end
+	if s.rename then return ui.col({rename_view(s)}) end
 	if s.picker then return ui.col({picker.view(s.picker, s.busy)}) end
 	if s.confirm then return ui.col({confirm_view(s)}) end
 	if s.menu then return ui.col({menu_view(s)}) end
@@ -1386,14 +1993,28 @@ end
 
 local panel: BlockDef<any> = {
 	init = function(cx, args, saved)
-		local s: any = {cx = cx, mode = args and args[1] or "projects", ctx_cwd = args and args[2] or "", view = "mine", projects = {}, pinned = {}, recent = {}, expanded = {}, more = {}, settings = {icon_style = "color"}, query = tf.new(""), query_all = false, scope = "all", sort = "updated", results = {}, total = 0, offset = 0, page = 0, rows = {}, order = {}, gen = 0, tokens = {}, alive = true, busy = false, indexing = false, loaded = false, archived = {}}
+		local s: any = {cx = cx, mode = args and args[1] or "projects", ctx_cwd = args and args[2] or "", view = "mine", projects = {}, pinned = {}, recent = {}, expanded = {}, more = {}, settings = {icon_style = "color"}, query = tf.new(""), query_all = false, scope = "all", sort = "updated", results = {}, total = 0, offset = 0, page = 0, rows = {}, order = {}, gen = 0, tokens = {}, alive = true, busy = false, indexing = false, loaded = false, archived = {}, open_chats = {}, open_sessions = {}, parked = {}}
 		if saved then
 			if saved.view == "mine" or saved.view == "discovered" then s.view = saved.view end
 			if saved.scope == "workspace" or saved.scope == "repository" or saved.scope == "all" then s.scope = saved.scope end
 			if saved.sort == "updated" or saved.sort == "relevance" then s.sort = saved.sort end
 			if type(saved.query) == "string" then tf.set(s.query, saved.query) end
 		end
-		pcall(tern.fs.write, tern.plugin.data .. "/panel-cols", tostring(cx.cols))
+		local expanded = store.get(store.EXPANDED_KEY)
+		if type(expanded) == "table" then
+			for key, open in expanded do if type(key) == "string" and open == true then s.expanded[key] = true end end
+		end
+		-- A restored sidebar keeps its collapsed state (rail or tile); a new one opens at the remembered width, or
+		-- as the icon rail when the sidebar was last collapsed to it.
+		if saved then
+			s.collapsed = if type(saved.collapsed) == "boolean" then saved.collapsed else store.get(store.COLLAPSED_KEY) == true
+			s.tile = s.collapsed and saved.tile == true
+			s.fitted = true
+		else
+			s.collapsed = store.collapse_style() == "rail" and store.get(store.COLLAPSED_KEY) == true
+			fit_soon(s)
+		end
+		tern.timer(80, function() if live(s) then open_window_url(s, "tern-projects://sidebar?state=sync&pane=" .. tostring(s.cx.pane)) end end)
 		rebuild(s)
 		refresh(s)
 		local function tick()
@@ -1402,11 +2023,58 @@ local panel: BlockDef<any> = {
 		tick()
 		return s
 	end,
-	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort} end,
-	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes.
-	resize = function(s, cols, _rows, _cx) s.cols = cols end,
+	save = function(s) return {mode = s.mode, view = s.view, query = s.query.text, scope = s.scope, sort = s.sort, collapsed = s.collapsed == true, tile = s.tile == true} end,
+	-- Width-dependent layout (row previews, icon-only controls) must follow pane resizes; the expanded width
+	-- the user settles on becomes the remembered sidebar width.
+	resize = function(s, cols, _rows, _cx)
+		local known = s.cols ~= nil
+		s.cols = cols
+		if s.tile then
+			-- A floating tile: Tern sizes it; its width is neither a target nor the user's choice.
+		elseif s.checking then
+			-- A sizing answer is still landing; check once it settles.
+			check_width_soon(s)
+		elseif not known then
+			-- The first width Tern reports to a block restored by a plugin reload: fit to it.
+			fit_soon(s)
+		elseif not s.collapsed and cols >= store.MIN_WIDTH then
+			remember_width(s)
+		end
+	end,
 	title = function(s) return if s.mode == "projects" then "Projects" elseif s.mode == "search" then "Projects · Search" else "Projects · Settings" end,
 	view = function(s, cx)
+		-- Collapsed as a tile: a floating card over the main chat with a large expand button, the latest chats
+		-- (opening one expands nothing; it opens beside the sidebar's tab as usual) and New chat.
+		if s.collapsed and s.tile then
+			local mod = if tern.runtime.os == "macos" then "Cmd" else "Ctrl"
+			local items: {any} = {
+				c.button("Expand Projects", "sidebar=expand", {key = "expand", icon = "sidebar", variant = "primary"}),
+			}
+			for i = 1, math.min(#(s.recent or {}), 3) do
+				local chat = s.recent[i]
+				table.insert(items, c.button(chat.title or chat.uid, "open-in-main=" .. fmt.pct(chat.uid), {key = "recent-" .. i, variant = "ghost", icon = fmt.agent_icon(chat.agent or "")}))
+			end
+			table.insert(items, c.button(launch_hint(s) .. " (" .. mod .. "+N)", "new-chat", {key = "new-chat", variant = "ghost", icon = "pen"}))
+			local idle_parked = 0
+			for _, p in s.parked or {} do if p.state ~= "working" then idle_parked += 1 end end
+			if idle_parked > 0 then
+				table.insert(items, c.button("Close " .. fmt.plural(idle_parked, "idle parked tile"), "close-idle-parked", {key = "clear-parked", variant = "ghost", icon = "x"}))
+			end
+			return {main = ui.col({ui.el("div", {key = "tile", class = "tp-tile"}, items)})}
+		end
+		-- Collapsed as a rail: a narrow icon column. Tern keeps every split at least a tenth of its parent, so the
+		-- rail can't shrink to a few cells in a one-chat tab; it uses that room for the views and New chat.
+		-- Opening a view expands the sidebar; New chat starts without expanding.
+		if s.collapsed then
+			local mod = if tern.runtime.os == "macos" then "Cmd" else "Ctrl"
+			return {main = ui.col({ui.el("div", {key = "strip", class = "tp-strip"}, {
+				c.icon_button("sidebar", "sidebar=expand", "Expand Projects", {key = "expand", variant = "ghost", size = "sm"}),
+				c.icon_button("folder", "strip=projects", "Projects", {key = "projects", variant = "ghost", size = "sm"}),
+				c.icon_button("search", "strip=search", "Search chats", {key = "search", variant = "ghost", size = "sm"}),
+				c.icon_button("pen", "new-chat", launch_hint(s) .. " (" .. mod .. "+N)", {key = "new-chat", variant = "ghost", size = "sm"}),
+				c.icon_button("gear", "strip=settings", "Settings", {key = "settings", variant = "ghost", size = "sm"}),
+			})})}
+		end
 		-- `cx.cols` is a placeholder until the pane reports a resize; only trust reported widths.
 		local cols = s.cols or 44
 		local children: {any} = {nav_view(s, cols < 48)}
@@ -1436,6 +2104,11 @@ local panel: BlockDef<any> = {
 		return result
 	end,
 	key = function(s, k, _cx)
+		if s.collapsed then
+			-- The rail and the tile only expand from the keyboard.
+			if k.name == "enter" or k.name == "space" or k.name == "right" then request_sidebar(s, "expand"); return true end
+			return false
+		end
 		if s.busy then if k.name == "escape" then hide_busy(s) end; return true end
 		if s.editor then
 			local d = s.editor
@@ -1448,6 +2121,7 @@ local panel: BlockDef<any> = {
 			editor_intent(s, intent, value)
 			return handled
 		end
+		if s.rename then return rename_key(s, k) end
 		if s.picker then
 			local _, intent = picker.key(s.picker, k)
 			picker_action(s, intent)
@@ -1468,19 +2142,51 @@ local panel: BlockDef<any> = {
 			return true
 		end
 		if name == "r" and k.ctrl then refresh(s); return true end
-		if name == "n" and (k.meta or (k.ctrl and tern.runtime.os ~= "macos")) then new_chat(s, nil, k.shift == true); return true end
+		if name == "n" and (k.meta or (k.ctrl and tern.runtime.os ~= "macos")) then new_chat(s, nil, k.shift == true, "main"); return true end
 		if name == "/" and s.mode ~= "search" then change_mode(s, "search"); return true end
 		if name == "escape" and s.mode ~= "search" then s.sel = nil; s.settings_focus = nil; return true end
 		if s.mode == "settings" then return settings_key(s, k) end
 		if name == "f10" and k.shift then open_menu(s, nil); return true end
 		if name == "up" or name == "down" then nav(s, if name == "up" then -1 else 1); return true end
 		if name == "page_up" or name == "page_down" then for _ = 1, 10 do nav(s, if name == "page_up" then -1 else 1); if s.loading then break end end; return true end
-		if name == "enter" then activate(s, s.sel); return true end
+		if name == "enter" then
+			local cmd_mod = k.meta or (k.ctrl and tern.runtime.os ~= "macos")
+			if cmd_mod and s.sel then
+				local r = s.rows[s.sel]
+				if r and (r.kind == "session" or r.kind == "parked") then
+					row_action(s, if k.shift then "open-in-new-tab" else "split-right", s.sel)
+				elseif r and r.kind == "project" and not k.shift then
+					row_action(s, "new-chat-in-split-right", s.sel)
+				end
+				return true
+			end
+			activate(s, s.sel)
+			return true
+		end
+		if (name == "delete" or (name == "backspace" and s.mode ~= "search")) and s.sel then
+			local r = s.rows[s.sel]
+			if r and r.kind == "parked" then
+				row_action(s, "close-parked-tile", s.sel)
+				return true
+			end
+		end
 		if name == "y" and k.ctrl then action(s, "copy-resume-command", nil); return true end
+		if name == "b" and (k.meta or (k.ctrl and tern.runtime.os ~= "macos")) and s.sel then
+			action(s, if k.shift then "fork-in-split-right" else "fork-chat", fmt.pct(s.sel))
+			return true
+		end
+		if name == "f2" and s.sel then
+			local r = s.rows[s.sel]
+			if r and r.kind == "session" then open_rename(s, r.ref); return true
+			elseif r and r.kind == "parked" then
+				local chat = known_chat_for_pane(s, r.ref)
+				if chat then open_rename(s, chat); return true end
+			end
+		end
 		if s.mode == "projects" then
 			if name == "left" or name == "right" then
 				local row = s.rows[s.sel or ""]
-				if row and row.kind == "project" then s.expanded[s.sel] = name == "right"; rebuild(s)
+				if row and row.kind == "project" then set_expanded(s, s.sel, name == "right"); rebuild(s)
 				elseif row and row.parent and name == "left" then s.sel = row.parent end
 				return true
 			end
@@ -1501,6 +2207,7 @@ local panel: BlockDef<any> = {
 		return false
 	end,
 	event = function(s, ev, cx)
+		if type(ev.window) == "string" then s.window = ev.window end
 		local id, name = ev.id or "", ev.ev
 		if s.menu and string.sub(id, 1, 11) ~= "layer.menu." and id ~= "layer.menu" then s.menu = nil end
 		if name == "focus" or name == "edit" then
@@ -1511,6 +2218,11 @@ local panel: BlockDef<any> = {
 				if name == "focus" then s.editor.focus = "name" end
 				if s.editor.focus ~= "name" then return end
 				field = s.editor.name
+			elseif s.rename then
+				if id ~= RENAME_FIELD then return end
+				if name == "focus" then s.rename.focus = "title" end
+				if s.rename.focus ~= "title" then return end
+				field = s.rename.input
 			elseif not s.editor and not s.picker and not s.confirm and not s.menu and s.mode == "search" and id == SEARCH_FIELD then field = s.query end
 			if not field then return end
 			if name == "focus" then cx:frame({{"focus", id}})
@@ -1520,6 +2232,8 @@ local panel: BlockDef<any> = {
 					if field == s.query then
 						s.query_all = false
 						if before ~= field.text then search_changed(s) end
+					elseif s.rename and field == s.rename.input then
+						s.rename.selected_all = false; s.rename.touched = true; s.rename.error = nil
 					else s.editor.selected_all = false; s.editor.name_touched = true end
 				end
 			end
@@ -1536,14 +2250,45 @@ local panel: BlockDef<any> = {
 			elseif not s.editor and not s.confirm and not s.menu and id == "main.rows" then
 				local key = string.match(item, "^main%.rows%.(.+)$") or item
 				local row = s.rows[key]
-				if row and navigable(row) then s.sel = key; if name == "activate" then activate(s, key) end end
+				if row and navigable(row) and not (name == "select" and just_opened == key) then
+					s.sel = key; if name == "activate" then activate(s, key) end
+				end
 			end
 		elseif name == "action" then
 			local act, value = ev.act or "", ev.value
-			if string.sub(act, 1, 5) == "open=" then
+			if act == "live-panes" then
+				s.open_chats = if type(ev.open) == "table" then ev.open else {}
+				s.open_sessions = if type(ev.sessions) == "table" then ev.sessions else {}
+				s.parked = if type(ev.parked) == "table" then ev.parked else {}
+				if type(ev.cwd) == "string" and ev.cwd ~= "" then s.ctx_cwd = ev.cwd end
+				rebuild(s)
+			elseif string.sub(act, 1, 5) == "open=" then
 				local payload = string.sub(act, 6)
 				local mode, cwd = string.match(payload, "^([^:]+):?(.*)")
 				if mode then s.editor = nil; cancel_flow(s); if cwd ~= "" then s.ctx_cwd = cwd end; change_mode(s, mode) end
+				-- Opening Projects, Search or Settings shows the full sidebar.
+				if s.collapsed then request_sidebar(s, "expand") end
+			elseif act == "sidebar" then
+				if value == "collapse" or value == "expand" then request_sidebar(s, value) end
+			elseif act == "strip" then
+				-- A collapsed rail's view button: show that view in the expanded sidebar.
+				if value == "projects" or value == "search" or value == "settings" then
+					change_mode(s, value)
+					request_sidebar(s, "expand")
+				end
+			elseif act == "sidebar-fit" then fit_soon(s)
+			elseif act == "sidebar-hold" then
+				-- Alone in its tab: widths until the next fit are not the user's.
+				s.fitted = false
+			elseif act == "sidebar-state" then
+				-- The window's answer to a sizing request; `share` is this sidebar's share of its tab's width.
+				s.sizing = nil
+				s.share = ev.share
+				s.collapsed = value == "collapsed"
+				s.tile = ev.tile == true
+				if s.collapsed then s.menu = nil end
+				-- A tile's size is Tern's; nothing to check.
+				if not s.tile then check_width_soon(s) end
 			elseif s.editor then
 				if s.editor.browser then
 					if act == "close" or act == "add" then browser_intent(s, act, nil)
@@ -1555,6 +2300,8 @@ local panel: BlockDef<any> = {
 					end
 				elseif act == "editor" then action(s, act, value) end
 			elseif s.picker then picker_action(s, act)
+			elseif s.rename then
+				if act == "rename" and value then rename_intent(s, value) end
 			elseif s.confirm then
 				if act == "confirm" and value then confirm_action(s, value) end
 			elseif s.menu then
@@ -1562,7 +2309,7 @@ local panel: BlockDef<any> = {
 			else
 				if value == nil then
 					local target = string.match(id, "^main%.rows%.(.+)$")
-					if target and s.rows[target] and table.find(menu_ids(s, target), act) then value = fmt.pct(target) end
+					if act ~= "-" and target and s.rows[target] and table.find(menu_ids(s, target), act) then value = fmt.pct(target) end
 				end
 				action(s, act, value)
 			end

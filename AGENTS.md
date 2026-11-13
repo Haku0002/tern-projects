@@ -14,13 +14,14 @@ docs/                Documentation and technical guides
   adding-a-harness.md Step-by-step guide for implementing new assistant adapters
   screenshots/       Showcase images for README and documentation
 host.luau            Host process half: registers the panel block
-window.luau          Window process half: keybind migration, toggles, launch/resume routes
+window.luau          Window process half: keybind migration, per-tab sidebar toggle/sizing, chat placement routes
 blocks/panel.luau    Main UI: Projects (My Projects / Discovered), Search, Settings
 lib/backend.luau     Automatic Cargo build at host startup, binary cache, request queuing
 lib/cli.luau         Binary discovery, CLI invocation, JSON decoding
 lib/fmt.luau         Formatting helpers: dates, agent labels/icons, URL encoding, snippets
 lib/input.luau       Keyboard shortcuts and native UTF-16 edit handling
 lib/picker.luau      Modal picker component for selection sheets
+lib/store.luau       `tern.kv` keys and helpers shared by the panel and window (sidebar width/collapsed/collapse style/measured tab width/auto tabs/expansion, open chats)
 lib/project-editor.luau  Unsaved project draft state and child directory browser
 lib/textfield.luau   UTF-8 text field component
 lib/ui.luau          Reusable UI elements, layout widgets, and list views
@@ -47,7 +48,7 @@ tern.d.luau          Generated Tern type stubs (gitignored)
 
 1. **Host / Window Split**:
    - **Host** (`host.luau`): Runs in the Tern host process. Registers blocks, manages persistent host state, and triggers on-demand background builds (`lib/backend.luau`).
-   - **Window** (`window.luau`): Runs in each Tern window. Handles keyboard shortcuts, action palette commands, and dispatches IPC launch/resume routes (`tern-projects://launch`, `tern-projects://resume`).
+   - **Window** (`window.luau`): Runs in each Tern window. Handles keyboard shortcuts, action palette commands, the per-tab sidebar, and dispatches IPC routes (`tern-projects://launch`, `tern-projects://resume`, `tern-projects://sidebar`).
 
 2. **Frontend UI (Luau)**:
    - `blocks/panel.luau`: Primary sidebar UI featuring three main views: Projects (My Projects & Discovered), Search (scoped FTS), and Settings.
@@ -96,6 +97,11 @@ tern plugin reload                               # Reload plugin in running Tern
 - **Launch and Resume Contracts**:
   - Fresh chats launch with the primary project directory as `cwd`. Any additional folders are passed via harness-supported CLI flags (e.g. `--add-dir`), or a warning is surfaced before launching primary-only.
   - Command generation must be safely quoted per OS (`shell_join` on Unix, Base64-encoded command blocks on Windows).
+  - Panel → window URLs: `tern-projects://resume?...`, `tern-projects://launch?...`, `tern-projects://pane?op=<show|park|close|close-idle-parked|close-all-parked>[&pane=<id>][&place=<…>]` and `tern-projects://sidebar?state=<collapse|expand|fit|sync>&pane=<id>[&cols=<n>][&rail=1]`. Every panel URL carries `&src=<panel_pane>&tok=<sidebar.auth>` (a capability token written by the panel VM to `tern.kv`), verified by `window.luau` along with checking that `src` is a live `tern-projects.panel` in a tab of this window; this allows unfocused right-click actions while preventing terminal/chat links from spoofing routes. `main` parks live chats (closing only already-exited panes or untouched OSC-133 shell prompts) and launches beside them; `right`/`down` split the main pane; `tab` is the only path that opens a new tab.
+  - Live pane sync: `window.luau` inspects `cx.session:panes()` and `cx.agents:list()` (`tern.json.null`-safe) and pushes deduplicated `live-panes` events (`open`, `sessions`, `parked`, and the tab's active main-chat `cwd`) to each open panel; `float_moved` docks a dragged floating tile back to the left edge at its remembered width.
+  - Width snapping: the window API can't read pane sizes, so once a fit settles within 2 cells of the remembered width the panel stores `cols / share` as `sidebar.tab_cols`. The window computes a sidebar's share from `cx.session:layout(tab)` (product of right-split ratios on its path) and resizes it to the remembered width in the same handler that docks it, so no frame shows it at Tern's default half split.
+  - OMP chains: omp moves a live session to a new file (new id, history copied) when another omp process holds it, and keeps the old file. `adapters/omp.rs` groups such files per folder (`continuationOf`; older omp: `parentSession` + inherited `providerPromptCacheKey` + the same first entry) and lists each chain once, as its newest file, with uid `omp:<first session id>` and `resume.sessions` = every id in the chain. `db::upsert_session` keeps one row per source, so a file that joins a chain drops its old row. Resume URLs carry `&sessions=<ids>`; the window refuses to start omp when a running omp process's command line names one of them (`cx.procs`), unless the chat is already open in a tracked pane (then it is shown). Deletion (`delete_files.rs`) removes every file of the chain and its `history.db` rows.
+- **Paths**: Stored and emitted paths never use the Windows verbatim prefix (`\\?\`). The backend normalizes them before writing `library.sqlite`/`index.sqlite` or emitting JSON; Luau compares directories case- and separator-insensitively on Windows.
 
 ## Code Conventions
 

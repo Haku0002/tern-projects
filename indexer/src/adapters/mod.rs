@@ -14,4 +14,6 @@ pub trait Adapter {
     fn candidates(&mut self, home: &Path) -> anyhow::Result<Vec<Candidate>>;
     /// Ok(None): not a listable session (empty, no user text).
     fn parse(&mut self, home: &Path, c: &Candidate) -> anyhow::Result<Option<Parsed>>;
+    /// The id in the chat's uid (`<agent>:<id>`): the session's own unless one chat spans several sources.
+    fn uid_id(&self, _c: &Candidate, parsed: &Parsed) -> String { parsed.id.clone() }
 }

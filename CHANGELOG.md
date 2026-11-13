@@ -1,6 +1,33 @@
 # Changelog
 
-All notable changes to `tern-projects` will be documented in this file.
+All notable changes to this customized fork (`Haku0002/tern-projects`, forked from `thegeneralist01/tern-projects`) will be documented in this file.
+
+## [Unreleased]
+
+### Added
+- **Chat placement & grouped context menus**: chat context menus separate placement (**Open in Main**, **Split Right**, **Split Down**, **Open in New Tab**), forking, live-pane controls, organization (**Rename…**, **Pin**, **Move to project…**, **Archive**), copy/options, and **Delete permanently…** with dividers in both native right-click and keyboard menus. Project menus separate new-chat placement, project editing/removal, and options.
+- **Collapsible sidebar**: a header button collapses Projects, chosen under **Settings → Sidebar → When collapsed**: hidden (parked; brought back by `Ctrl + Alt + S` or the status line's **Projects** button), an icon rail (expand, Projects, Search, New chat, Settings), or a tile (a card floating over the main chat's top-left corner with a large **Expand Projects** button, the three latest chats and New chat). Expand restores the last width. Width, collapsed state, collapse style and unfolded projects persist in `tern.kv`.
+- **Sidebar in every tab**: new tabs open with the sidebar on their left, without taking focus (off switch: **Settings → Sidebar → Open in new tabs**; skipped while the sidebar is hidden).
+- **Selection card switch**: **Settings → Sidebar → Selection card** turns off the card that clicking a chat or folder shows at the sidebar's foot; a click then only selects, and right-click, `Enter` and `Ctrl + Y` work as before.
+- **Parked tile management & live chat state**: when panes sit in Tern's parked-pane deck, a foldable **Parked** section at the top of Projects lists them with live status (`Working`, `Waiting`, `Exited`), an inline `×` button to close all idle parked tiles in one click, `Delete` to close the selected tile, and a right-click menu (**Close parked tile**, **Close idle parked**, **Close all parked…**) that closes tiles directly without unparking them first. Chat rows across Pinned, Projects, Recents and Search also show live open (`●`) / parked (`○`) dots and offer **Close parked tile** / **Park chat pane** / **Close chat pane** on right-click. Added **Projects: Close Parked Panes…** in the command palette (and a `Parked · N` status segment when the status bar is on) plus `Ctrl + Enter` (Split Right) and `Ctrl + Shift + Enter` (Open in New Tab) shortcuts.
+- **Fork chat from context menu & keyboard**: right-clicking an OMP, Claude Code or Codex chat (including in the **Parked** section) offers **Fork chat** (`Ctrl + B` / `⌘B`), **Fork in Split Right** (`Ctrl + Shift + B` / `⇧⌘B`), **Fork in Split Down** and **Fork in New Tab** (`omp --fork <file>`, `claude --resume <id> --fork-session`, `codex fork <id>`). Existing indexed rows gain fork commands on read without requiring a database wipe, and OMP's rotation grouping preserves `omp --fork` copies as separate conversations. Unrenamed forked sessions automatically show a `[Fork] ` title prefix (removed once you rename the session via `/rename`), and fork commands never hijack the parent chat's live indicator or lock guard.
+- **Rename chats (`Rename…` / `F2`)**: right-clicking any chat (including chat-backed rows in **Parked**) or pressing `F2` opens a **Rename chat** dialog across all six harnesses without touching source transcript files. Custom titles are stored durably in `library.sqlite` (schema v2, migrated cleanly from v1), keep FTS5 search synced, survive `index.sqlite` rebuilds, and include a **Reset original** action to restore the indexed title.
+
+### Changed
+- Double-click, `Enter` and the dock's **Resume** open chats in the main area beside the pinned sidebar instead of a new tab; the replaced chat is parked (still running) and swaps back when reopened. New chats follow the same placement. Only **Open in New Tab** creates a tab.
+- A chat that is already open is focused or swapped back in rather than launched twice.
+- The sidebar is one per tab: toggling deals a parked sidebar back in instead of starting another.
+- A sidebar that opens in a new tab, comes back from hiding or docks back from the tile lands at the remembered width straight away instead of appearing at half the tab first. The window sizes it from the tab width the sidebar last measured (`sidebar.tab_cols`); until one is measured it still fits itself after landing.
+- Opening a chat by double-click or `Enter` closes the selected chat's action card, including after a single click shortly before the double-click (Tern reports the third click as a fresh selection, which no longer reopens the card, also when the chat opens in another tab).
+- Pressing `Ctrl + Alt + S` while the expanded sidebar is focused now collapses it using **Settings → Sidebar → When collapsed** (instead of destroying the pane), and expands a rail-collapsed sidebar back on the next press. Hiding sidebars in multiple tabs keeps at most one parked Projects sidebar in the deck, and replacing an exited pane or untouched OSC-133 shell prompt in the main area closes it instead of parking a dead/blank shell tile.
+- Sidebar actions carry a shared per-VM capability token (`sidebar.auth`) and panel pane id, so right-clicking or clicking buttons in an unfocused sidebar works immediately while links in terminal/chat output still cannot trigger plugin routes; each sidebar also tracks its tab's active chat folder for **New chat** and **Worktree / Repository** search scopes, and dragging a floating **Tile** sidebar into a split (`float_moved`) docks and expands it cleanly.
+
+### Fixed
+- Windows: the backend no longer stores or emits `\\?\` verbatim paths. The index schema version is bumped to 3 (`2` dropped verbatim paths; `3` adds `[Fork] ` title prefixing for unrenamed forks), so the history index rebuilds once on first run (the project library is untouched).
+- OMP chats no longer show up twice (or more). When a session is open in more than one omp process, omp moves it to a new session file with the history copied over and keeps the old file; the index listed every file as its own chat. It now follows that chain (`continuationOf`, or for older omp a parent link plus the copied history and inherited prompt-cache key) and lists it once, as the most recently written file, under the first session's id so pins and project assignments stay put. `/new` sessions and branches are still separate chats. Permanently deleting such a chat removes every file of the chain.
+- Opening an OMP chat that another omp process already has open (outside this sidebar's panes) no longer starts a second omp on it, which is what made omp copy it to a new file. A notice names the running process instead.
+
+---
 
 ## [0.2.3] — 2026-10-16
 

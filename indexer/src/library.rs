@@ -30,6 +30,8 @@ pub enum Request {
         pinned: Option<bool>,
         archived: Option<bool>,
         assignment: Option<Assignment>,
+        #[serde(default)]
+        title: Patch<Value>,
     },
     Archived {
         limit: i64,
@@ -113,9 +115,9 @@ impl Library {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version == 0 {
-            // Another opener may initialize the library while we wait for this lock.
-            // Only the version read under the write lock can authorize schema creation.
+        if version == 0 || version == 1 {
+            // Another opener may initialize or migrate the library while we wait for this lock.
+            // Only the version read under the write lock can authorize schema changes.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             if version == 0 {
@@ -131,12 +133,18 @@ impl Library {
                 tx.execute_batch("
                     CREATE TABLE projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,icon TEXT NOT NULL,created_ms INTEGER NOT NULL);
                     CREATE TABLE project_folders(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position),UNIQUE(project_id,path));
-                    CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER);
+                    CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER,custom_title TEXT);
                     CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                    PRAGMA user_version=1;")?;
+                    PRAGMA user_version=2;")?;
+            } else if version == 1 {
+                // Validate pre-migration v1 schema before altering it.
+                validate_v1_schema(&tx)?;
+                tx.execute_batch(
+                    "ALTER TABLE chat_state ADD COLUMN custom_title TEXT; PRAGMA user_version=2;",
+                )?;
             } else {
                 anyhow::ensure!(
-                    version == 1,
+                    version == 2,
                     "unsupported library schema version {version}; library was not overwritten"
                 );
             }
@@ -144,7 +152,7 @@ impl Library {
             tx.commit()?;
         } else {
             anyhow::ensure!(
-                version == 1,
+                version == 2,
                 "unsupported library schema version {version}; library was not overwritten"
             );
             validate_library(&conn)?;
@@ -173,9 +181,14 @@ impl Library {
             .conn
             .prepare("SELECT path FROM project_folders WHERE project_id=? ORDER BY position")?;
         for p in &mut projects {
-            p.folders = folders
-                .query_map([id(&p.id)?], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+            // Rows saved before folders were simplified hold the verbatim spelling;
+            // read both spellings of one folder as that folder once.
+            for folder in folders.query_map([id(&p.id)?], |r| r.get::<_, String>(0))? {
+                let folder = simplified(folder?);
+                if !p.folders.contains(&folder) {
+                    p.folders.push(folder);
+                }
+            }
             anyhow::ensure!(
                 !p.folders.is_empty(),
                 "malformed library: project {} has no source folders",
@@ -291,13 +304,25 @@ impl Library {
         tx.commit()?;
         Ok(json!({"ok":true}))
     }
+    pub fn custom_titles(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid, custom_title FROM chat_state WHERE custom_title IS NOT NULL AND custom_title <> ''")?;
+        let mut out = HashMap::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (uid, title) = row?;
+            out.insert(uid, title);
+        }
+        Ok(out)
+    }
     pub fn update_chat(
         &mut self,
         uid: &str,
         pinned: Option<bool>,
         archived: Option<bool>,
         assignment: Option<Assignment>,
-    ) -> Result<Value> {
+        title: Patch<Value>,
+    ) -> Result<(Value, Option<Option<String>>)> {
         anyhow::ensure!(!uid.is_empty(), "missing chat UID");
         let assigned = match &assignment {
             Some(a) => match a.mode.as_str() {
@@ -319,6 +344,16 @@ impl Library {
             },
             None => None,
         };
+        let new_title: Option<Option<String>> = match title {
+            Patch::Missing => None,
+            Patch::Present(Value::Null) => Some(None),
+            Patch::Present(Value::String(s)) => {
+                let cleaned = crate::text::one_line(&s, 120);
+                anyhow::ensure!(!cleaned.is_empty(), "Title: enter a chat title");
+                Some(Some(cleaned))
+            }
+            Patch::Present(_) => bail!("invalid chat title"),
+        };
         let tx = self.conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO chat_state(uid) VALUES(?)", [uid])?;
         if let Some(pinned) = pinned {
@@ -333,8 +368,14 @@ impl Library {
                 params![a.mode, assigned, uid],
             )?;
         }
+        if let Some(custom) = &new_title {
+            tx.execute(
+                "UPDATE chat_state SET custom_title=? WHERE uid=?",
+                params![custom.as_deref(), uid],
+            )?;
+        }
         tx.commit()?;
-        Ok(json!({"ok":true}))
+        Ok((json!({"ok":true}), new_title))
     }
     pub fn update_settings(
         &mut self,
@@ -369,37 +410,80 @@ fn validate_library(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn validate_v1_schema(conn: &Connection) -> Result<()> {
+    validate_tables(
+        conn,
+        &[
+            (
+                "projects",
+                &[
+                    ("id", "INTEGER", 1),
+                    ("name", "TEXT", 0),
+                    ("icon", "TEXT", 0),
+                    ("created_ms", "INTEGER", 0),
+                ],
+            ),
+            (
+                "project_folders",
+                &[
+                    ("project_id", "INTEGER", 1),
+                    ("position", "INTEGER", 2),
+                    ("path", "TEXT", 0),
+                ],
+            ),
+            (
+                "chat_state",
+                &[
+                    ("uid", "TEXT", 1),
+                    ("assignment", "TEXT", 0),
+                    ("project_id", "INTEGER", 0),
+                    ("pinned_ms", "INTEGER", 0),
+                    ("archived_ms", "INTEGER", 0),
+                ],
+            ),
+            ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
+        ],
+    )
+}
+
 fn validate_schema(conn: &Connection) -> Result<()> {
-    let tables: &[(&str, &[(&str, &str, i64)])] = &[
-        (
-            "projects",
-            &[
-                ("id", "INTEGER", 1),
-                ("name", "TEXT", 0),
-                ("icon", "TEXT", 0),
-                ("created_ms", "INTEGER", 0),
-            ],
-        ),
-        (
-            "project_folders",
-            &[
-                ("project_id", "INTEGER", 1),
-                ("position", "INTEGER", 2),
-                ("path", "TEXT", 0),
-            ],
-        ),
-        (
-            "chat_state",
-            &[
-                ("uid", "TEXT", 1),
-                ("assignment", "TEXT", 0),
-                ("project_id", "INTEGER", 0),
-                ("pinned_ms", "INTEGER", 0),
-                ("archived_ms", "INTEGER", 0),
-            ],
-        ),
-        ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
-    ];
+    validate_tables(
+        conn,
+        &[
+            (
+                "projects",
+                &[
+                    ("id", "INTEGER", 1),
+                    ("name", "TEXT", 0),
+                    ("icon", "TEXT", 0),
+                    ("created_ms", "INTEGER", 0),
+                ],
+            ),
+            (
+                "project_folders",
+                &[
+                    ("project_id", "INTEGER", 1),
+                    ("position", "INTEGER", 2),
+                    ("path", "TEXT", 0),
+                ],
+            ),
+            (
+                "chat_state",
+                &[
+                    ("uid", "TEXT", 1),
+                    ("assignment", "TEXT", 0),
+                    ("project_id", "INTEGER", 0),
+                    ("pinned_ms", "INTEGER", 0),
+                    ("archived_ms", "INTEGER", 0),
+                    ("custom_title", "TEXT", 0),
+                ],
+            ),
+            ("settings", &[("key", "TEXT", 1), ("value", "TEXT", 0)]),
+        ],
+    )
+}
+
+fn validate_tables(conn: &Connection, tables: &[(&str, &[(&str, &str, i64)])]) -> Result<()> {
     for (table, expected) in tables {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = stmt
@@ -460,6 +544,77 @@ pub fn lexical(path: &Path) -> PathBuf {
     }
     out
 }
+/// `std::fs::canonicalize` without the Windows verbatim `\\?\` prefix whenever the
+/// legacy spelling names the same file. Shells and harnesses reject verbatim working
+/// directories (OMP derives its session directory from the cwd text).
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(simplified)
+}
+/// Spell a path the way it is stored, launched and displayed: `\\?\C:\x` becomes
+/// `C:\x` and `\\?\UNC\srv\share\x` becomes `\\srv\share\x`. Paths whose meaning
+/// depends on verbatim parsing stay verbatim; other platforms are unchanged.
+pub fn simplified<P: AsRef<Path> + From<String>>(path: P) -> P {
+    legacy_spelling(path.as_ref()).map_or(path, P::from)
+}
+#[cfg(not(windows))]
+pub fn legacy_spelling(_: &Path) -> Option<String> {
+    None
+}
+/// The equivalent legacy spelling of a verbatim drive or UNC path, if any. Win32
+/// parsing of the legacy form trims trailing dots and spaces, resolves `.` and `..`,
+/// maps DOS device names and stops at `MAX_PATH`; any path it would reinterpret keeps
+/// its prefix, as do roots without a legacy form such as `\\?\Volume{…}`.
+#[cfg(windows)]
+pub fn legacy_spelling(path: &Path) -> Option<String> {
+    use std::path::Prefix;
+    let text = path.to_str()?;
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return None;
+    };
+    let (verbatim, legacy) = match prefix.kind() {
+        // Without a root, `\\?\C:` would become the drive-relative `C:`.
+        Prefix::VerbatimDisk(_) if components.clone().next() == Some(Component::RootDir) => {
+            (r"\\?\", "")
+        }
+        Prefix::VerbatimUNC(server, share) if legacy_name(server) && legacy_name(share) => {
+            (r"\\?\UNC\", r"\\")
+        }
+        _ => return None,
+    };
+    if !text.get(..verbatim.len())?.eq_ignore_ascii_case(verbatim) {
+        return None;
+    }
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) if legacy_name(name) => {}
+            _ => return None,
+        }
+    }
+    let rest = &text[verbatim.len()..];
+    // Components hide the empty name in `a\\b`; the legacy form would drop it.
+    (!rest.contains(r"\\") && legacy.len() + rest.encode_utf16().count() < 260)
+        .then(|| [legacy, rest].concat())
+}
+#[cfg(windows)]
+fn legacy_name(name: &std::ffi::OsStr) -> bool {
+    const DEVICES: [&str; 32] = [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2",
+        "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+    ];
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    // `nul.txt` and `COM1 .log` still name devices.
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ');
+    !name.is_empty()
+        && name.encode_utf16().count() <= 255
+        && !name.ends_with(['.', ' '])
+        && !name.contains(|c: char| c < ' ' || r#"<>:"/\|?*"#.contains(c))
+        && !DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device))
+}
 pub fn expand(value: &str, cwd: &str, home: &Path) -> Result<PathBuf> {
     anyhow::ensure!(!value.is_empty(), "enter a folder path");
     anyhow::ensure!(
@@ -482,7 +637,7 @@ pub fn expand(value: &str, cwd: &str, home: &Path) -> Result<PathBuf> {
         );
         Path::new(cwd).join(path)
     };
-    Ok(lexical(&path))
+    Ok(simplified(lexical(&path)))
 }
 pub fn readable_dir(path: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
@@ -491,8 +646,7 @@ pub fn readable_dir(path: &Path) -> Result<PathBuf> {
         path.display()
     );
     std::fs::read_dir(path).with_context(|| format!("cannot read directory {}", path.display()))?;
-    std::fs::canonicalize(path)
-        .with_context(|| format!("cannot resolve directory {}", path.display()))
+    canonical(path).with_context(|| format!("cannot resolve directory {}", path.display()))
 }
 pub fn folders(value: &str, cwd: &str, home: &Path, offset: i64, limit: i64) -> Result<Value> {
     anyhow::ensure!(
@@ -526,7 +680,7 @@ pub struct Membership {
     paths: HashMap<String, PathBuf>,
 }
 fn normalized(path: &str) -> PathBuf {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| lexical(Path::new(path)));
+    let path = canonical(Path::new(path)).unwrap_or_else(|_| simplified(lexical(Path::new(path))));
     #[cfg(windows)]
     {
         PathBuf::from(path.to_string_lossy().to_lowercase())
@@ -567,6 +721,68 @@ impl Membership {
                         folders.iter().any(|folder| path.starts_with(folder))
                     })
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_take_the_equivalent_legacy_spelling() {
+        let longest = format!(r"\\?\C:\{}\{}", "a".repeat(200), "b".repeat(55));
+        for (verbatim, legacy) in [
+            (r"\\?\C:\Users\me\project", r"C:\Users\me\project"),
+            (r"\\?\e:\Game Development\.config", r"e:\Game Development\.config"),
+            (r"\\?\C:\", r"C:\"),
+            (r"\\?\UNC\server\share\dir", r"\\server\share\dir"),
+            (r"\\?\UNC\server\c$", r"\\server\c$"),
+            (longest.as_str(), &longest[4..]),
+        ] {
+            assert_eq!(simplified(verbatim.to_owned()), legacy);
+            assert_eq!(simplified(PathBuf::from(verbatim)), Path::new(legacy));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_without_an_equivalent_legacy_spelling_are_kept() {
+        let too_long = format!(r"\\?\C:\{}\{}", "a".repeat(200), "b".repeat(56));
+        for path in [
+            too_long.as_str(),
+            r"\\?\C:\trailing.",
+            r"\\?\C:\trailing ",
+            r"\\?\C:\dir\...",
+            r"\\?\C:\CON",
+            r"\\?\C:\dir\nul.txt",
+            r"\\?\C:\com1 .log",
+            r"\\?\C:\Lpt9",
+            r"\\?\C:\CONIN$",
+            r"\\?\C:\a\..\b",
+            r"\\?\C:\a\.\b",
+            r"\\?\C:\a\\b",
+            r"\\?\C:\a/b",
+            r"\\?\C:",
+            r"\\?\UNC\server",
+            r"\\?\UNC\server\share.\dir",
+            r"\\?\Volume{0b8c7a2e-1111-2222-3333-444455556666}\dir",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\dir",
+            r"\\.\C:\dir",
+            r"C:\already\legacy",
+            r"\\server\share\dir",
+            r"relative\dir",
+        ] {
+            assert_eq!(simplified(path.to_owned()), path);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_paths_are_never_rewritten() {
+        for path in [r"\\?\C:\Users\me", "/tmp/project"] {
+            assert_eq!(simplified(path.to_owned()), path);
         }
     }
 }

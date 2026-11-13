@@ -8,7 +8,8 @@ pub(super) struct Plan {
     rewrites: Vec<(PathBuf, Vec<u8>)>,
     history_db: Option<PathBuf>,
     history_tables: Vec<&'static str>,
-    id: String,
+    /// OMP history.db rows go for every session id the chat is stored under.
+    history_ids: Vec<String>,
 }
 
 pub(super) fn prepare(home: &Path, chat: &Chat) -> Result<super::Plan> {
@@ -46,7 +47,7 @@ pub(super) fn prepare(home: &Path, chat: &Chat) -> Result<super::Plan> {
         rewrites: vec![],
         history_db: None,
         history_tables: vec![],
-        id: chat.id.clone(),
+        history_ids: vec![chat.id.clone()],
     };
     let mut stamps = BTreeSet::new();
     inventory(&root, &source, &mut stamps)?;
@@ -57,24 +58,45 @@ pub(super) fn prepare(home: &Path, chat: &Chat) -> Result<super::Plan> {
             .context("Session has no parent")?
             .to_path_buf(),
     );
+    // An OMP chat that omp moved to new files (see adapters::omp) is the whole chain: delete every file, or
+    // the next older copy would take its place in the list.
+    let mut sessions: Vec<PathBuf> = vec![source.clone()];
     if chat.agent == "omp" {
-        add_optional_removal(&mut p, source.with_extension(""), &mut stamps)?;
-        let prefix = format!(
-            "{}.",
-            source
-                .file_name()
-                .context("Missing filename")?
-                .to_string_lossy()
-        );
+        if let Some(chain) = crate::adapters::omp::chain_of(&source)? {
+            for file in chain.files.iter().filter(|f| **f != source) {
+                safe_path(&root, file, false)?;
+                inventory(&root, file, &mut stamps)?;
+                p.removals.push(file.clone());
+                sessions.push(file.clone());
+            }
+            for id in chain.ids {
+                valid_id(&id)?;
+                if !p.history_ids.contains(&id) {
+                    p.history_ids.push(id);
+                }
+            }
+        }
+        for session in &sessions {
+            add_optional_removal(&mut p, session.with_extension(""), &mut stamps)?;
+        }
         let mut backups = vec![];
-        for entry in std::fs::read_dir(source.parent().unwrap())? {
-            let e = entry?;
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(".bak") && name.len() > prefix.len() + 4
-            {
-                safe_path(&root, &e.path(), false)?;
-                backups.push(e.path());
+        for session in &sessions {
+            let prefix = format!(
+                "{}.",
+                session
+                    .file_name()
+                    .context("Missing filename")?
+                    .to_string_lossy()
+            );
+            for entry in std::fs::read_dir(session.parent().context("Session has no parent")?)? {
+                let e = entry?;
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".bak") && name.len() > prefix.len() + 4
+                {
+                    safe_path(&root, &e.path(), false)?;
+                    backups.push(e.path());
+                }
             }
         }
         backups.sort();
@@ -153,10 +175,10 @@ pub(super) fn prepare(home: &Path, chat: &Chat) -> Result<super::Plan> {
         targets.extend(
             p.history_tables
                 .iter()
-                .map(|table| format!("{}: {table}[session_id={}]", db.display(), chat.id)),
+                .map(|table| format!("{}: {table}[session_id={}]", db.display(), p.history_ids.join(", "))),
         );
     }
-    let mut ids = vec![chat.id.clone()];
+    let mut ids = p.history_ids.clone();
     // Child transcript headers are read only inside an owned artifacts directory, never elsewhere.
     if chat.agent != "pi" {
         for path in &stamps {
@@ -353,7 +375,9 @@ pub(super) fn execute(p: &Plan) -> Result<()> {
         }
         if let Some(tx) = transaction {
             for table in &p.history_tables {
-                tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), [&p.id])?;
+                for id in &p.history_ids {
+                    tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), [id])?;
+                }
             }
             tx.commit()?;
             if let Some(path) = &p.history_db {
@@ -404,12 +428,14 @@ pub(super) fn verify(p: &Plan) -> Result<()> {
     if let Some(db) = &p.history_db {
         let conn = crate::db::open_readonly(db)?;
         for table in &p.history_tables {
-            let count: i64 = conn.query_row(
-                &format!("SELECT count(*) FROM {table} WHERE session_id=?1"),
-                [&p.id],
-                |r| r.get(0),
-            )?;
-            ensure!(count == 0, "OMP history still contains the deleted session");
+            for id in &p.history_ids {
+                let count: i64 = conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE session_id=?1"),
+                    [id],
+                    |r| r.get(0),
+                )?;
+                ensure!(count == 0, "OMP history still contains the deleted session");
+            }
         }
     }
     Ok(())

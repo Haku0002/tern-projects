@@ -91,16 +91,19 @@ fn concurrent_first_index_snapshot_query_and_save_preserve_library() {
         assert_eq!(projects[0]["id"], saved_id);
         assert_eq!(projects[0]["name"], "Saved during first open");
         assert_eq!(projects[0]["icon"], "rocket");
+        // Folders are reported canonical, without Windows' verbatim `\\?\` prefix.
+        let canonical = std::fs::canonicalize(&folder).unwrap();
+        let canonical = canonical.to_str().unwrap();
         assert_eq!(
             projects[0]["folders"],
-            json!([std::fs::canonicalize(&folder).unwrap()])
+            json!([canonical.strip_prefix(r"\\?\").unwrap_or(canonical)])
         );
         assert_eq!(projects[0]["count"], 0);
         let conn = rusqlite::Connection::open(temp.path().join("library.sqlite")).unwrap();
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             conn.query_row("SELECT count(*) FROM projects", [], |row| row

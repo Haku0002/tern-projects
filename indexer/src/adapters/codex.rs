@@ -2,7 +2,7 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{params, OpenFlags};
 use crate::model::{Candidate, Parsed, Resume};
-use crate::text::{clean_user, one_line, cap_body};
+use crate::text::{clean_user, one_line, cap_body, prefix_fork_title};
 use super::Adapter;
 
 pub struct CodexAdapter;
@@ -28,12 +28,12 @@ impl Adapter for CodexAdapter {
         let has_thread_source = has_column(&conn, "threads", "thread_source");
 
         let sql = if has_thread_source {
-            "SELECT id, updated_at_ms FROM threads \
+            "SELECT id, updated_at_ms, COALESCE(name,'') FROM threads \
              WHERE archived = 0 AND preview <> '' \
              AND source NOT LIKE '{%' \
              AND COALESCE(thread_source,'') <> 'subagent'"
         } else {
-            "SELECT id, updated_at_ms FROM threads \
+            "SELECT id, updated_at_ms, COALESCE(name,'') FROM threads \
              WHERE archived = 0 AND preview <> '' \
              AND source NOT LIKE '{%'"
         };
@@ -44,12 +44,13 @@ impl Adapter for CodexAdapter {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
                 ))
             })?
             .flatten()
-            .map(|(id, updated_ms)| Candidate {
+            .map(|(id, updated_ms, name)| Candidate {
                 source: format!("codex:{id}"),
-                version: updated_ms.to_string(),
+                version: if name.is_empty() { updated_ms.to_string() } else { format!("{updated_ms}:{name}") },
             })
             .collect();
         Ok(out)
@@ -110,17 +111,21 @@ impl Adapter for CodexAdapter {
             None
         };
 
+        let rollout_full = rollout_path.as_deref().filter(|rp| !rp.is_empty()).map(|rp| {
+            if Path::new(rp).is_absolute() {
+                rp.to_string()
+            } else {
+                home.join(rp).to_string_lossy().into_owned()
+            }
+        });
+        let forked_from = rollout_full.as_deref().and_then(|p| read_rollout_forked_from(Path::new(p)));
+
         let (messages, first_user, last_assistant, body_text) = if let Some(items) = items {
             parse_items(items)
-        } else if let Some(rp) = rollout_path {
+        } else if let Some(full) = &rollout_full {
             // Fall back to rollout file.
-            let rollout_full = if Path::new(&rp).is_absolute() {
-                rp
-            } else {
-                home.join(&rp).to_string_lossy().into_owned()
-            };
-            if Path::new(&rollout_full).exists() {
-                parse_rollout_items(&rollout_full)?
+            if Path::new(full).is_file() {
+                parse_rollout_items(full)?
             } else {
                 // No items and no rollout; use preview from DB.
                 let preview: String = conn.query_row(
@@ -153,7 +158,21 @@ impl Adapter for CodexAdapter {
             .find(|s| !s.is_empty())
             .copied()
             .unwrap_or_else(|| first_user_for_title.as_str());
-        let title = one_line(raw_title, 120);
+        let mut title = one_line(raw_title, 120);
+        if let Some(parent_id) = forked_from {
+            let same_name_as_parent = !name.is_empty()
+                && conn
+                    .query_row(
+                        "SELECT COALESCE(name,'') FROM threads WHERE id = ?1",
+                        params![parent_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                    .is_some_and(|pn| pn == name);
+            if name.is_empty() || same_name_as_parent {
+                title = prefix_fork_title(&title);
+            }
+        }
 
         let mut body = format!("{}\n{}", title, body_text);
         cap_body(&mut body, 1_000_000);
@@ -173,7 +192,8 @@ impl Adapter for CodexAdapter {
             resume: Resume::tab(
                 String::new(),
                 vec!["codex".to_string(), "resume".to_string(), id.to_string()],
-            ),
+            )
+            .with_fork(vec!["codex".to_string(), "fork".to_string(), id.to_string()]),
         }))
     }
 }
@@ -356,6 +376,7 @@ fn parse_rollout_items(path_str: &str) -> anyhow::Result<(i64, String, String, S
 fn parse_rollout_items_str(source_id: &str, content: &str, _path: &Path) -> anyhow::Result<Option<Parsed>> {
     let mut id = String::new();
     let mut cwd = String::new();
+    let mut forked_from_id: Option<String> = None;
     let mut model: Option<String> = None;
     let mut messages: i64 = 0;
     let mut first_user = String::new();
@@ -374,6 +395,9 @@ fn parse_rollout_items_str(source_id: &str, content: &str, _path: &Path) -> anyh
                 }
                 if cwd.is_empty() {
                     cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+                if forked_from_id.is_none() {
+                    forked_from_id = payload.get("forked_from_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
                 }
             }
         } else if rec_type == "turn_context" {
@@ -423,7 +447,10 @@ fn parse_rollout_items_str(source_id: &str, content: &str, _path: &Path) -> anyh
     if first_user.is_empty() { return Ok(None); }
     if id.is_empty() { id = source_id.strip_prefix("codex:").unwrap_or(source_id).to_string(); }
 
-    let title = one_line(&first_user, 120);
+    let mut title = one_line(&first_user, 120);
+    if forked_from_id.is_some() {
+        title = prefix_fork_title(&title);
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
     let mut body = format!("{}\n{}", title, body_parts.join("\n"));
@@ -441,7 +468,8 @@ fn parse_rollout_items_str(source_id: &str, content: &str, _path: &Path) -> anyh
         first_user,
         last_assistant,
         body,
-        resume: Resume::tab(String::new(), vec!["codex".to_string(), "resume".to_string(), id]),
+        resume: Resume::tab(String::new(), vec!["codex".to_string(), "resume".to_string(), id.clone()])
+            .with_fork(vec!["codex".to_string(), "fork".to_string(), id]),
     }))
 }
 
@@ -479,4 +507,77 @@ fn find_versioned(home: &Path, dir: &str, prefix: &str, suffix: &str) -> Option<
         }
     }
     best.map(|(_, p)| p)
+}
+
+fn read_rollout_forked_from(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(4) {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            return v.pointer("/payload/forked_from_id")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forked_codex_rollout_gets_prefix_unless_distinct_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_dir = tmp.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let rollout_fork = codex_dir.join("r_fork.jsonl");
+        std::fs::write(&rollout_fork, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"f1\",\"cwd\":\"E:\\\\work\",\"forked_from_id\":\"p1\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2026-11-12T01:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Parent task\"}]}}\n",
+        )).unwrap();
+        let rollout_renamed = codex_dir.join("r_ren.jsonl");
+        std::fs::write(&rollout_renamed, concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"f2\",\"cwd\":\"E:\\\\work\",\"forked_from_id\":\"p1\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2026-11-12T01:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Parent task\"}]}}\n",
+        )).unwrap();
+
+        let db = codex_dir.join("state_5.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+                source TEXT, cwd TEXT, title TEXT, archived INTEGER, git_branch TEXT,
+                model TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, preview TEXT, name TEXT
+            );"
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES ('p1', '', 1, 1, 'cli', 'E:\\\\work', 'Parent task', 0, '', '', 1000, 1000, 'Parent task', 'Parent Title')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES ('f1', ?1, 2, 2, 'cli', 'E:\\\\work', 'Parent task', 0, '', '', 2000, 2000, 'Parent task', '')",
+            params![rollout_fork.to_string_lossy().as_ref()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES ('f2', ?1, 3, 3, 'cli', 'E:\\\\work', 'Parent task', 0, '', '', 3000, 3000, 'Parent task', 'Custom Fork Name')",
+            params![rollout_renamed.to_string_lossy().as_ref()],
+        ).unwrap();
+        drop(conn);
+
+        let mut adapter = CodexAdapter;
+        let cands = adapter.candidates(tmp.path()).unwrap();
+        let mut titles = std::collections::HashMap::new();
+        for c in cands {
+            if let Some(p) = adapter.parse(tmp.path(), &c).unwrap() {
+                titles.insert(p.id, p.title);
+            }
+        }
+        assert_eq!(titles["f1"], "[Fork] Parent task");
+        assert_eq!(titles["f2"], "Custom Fork Name");
+    }
 }

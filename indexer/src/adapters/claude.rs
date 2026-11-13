@@ -1,7 +1,7 @@
 use std::path::Path;
 use anyhow::Context;
 use crate::model::{Candidate, Parsed, Resume};
-use crate::text::{clean_user, one_line, cap_body, iso_ms};
+use crate::text::{clean_user, one_line, cap_body, iso_ms, prefix_fork_title};
 use super::Adapter;
 
 pub struct ClaudeAdapter;
@@ -74,6 +74,8 @@ impl Adapter for ClaudeAdapter {
         let mut model: Option<String> = None;
         let mut title: Option<String> = None;
         let mut ai_title: Option<String> = None;
+        let mut has_forked_from = false;
+        let mut renamed_after_fork = false;
         let mut created_ms: Option<i64> = None;
         let mut updated_ms: Option<i64> = None;
         let mut first_user: Option<String> = None;
@@ -118,6 +120,12 @@ impl Adapter for ClaudeAdapter {
                 }
             }
 
+            if record.get("forkedFrom").is_some()
+                || record.get("type").and_then(|v| v.as_str()) == Some("fork-context-ref")
+            {
+                has_forked_from = true;
+            }
+
             // Title extraction.
             if let Some(t_type) = record.get("type").and_then(|v| v.as_str()) {
                 if t_type == "custom-title" {
@@ -128,6 +136,9 @@ impl Adapter for ClaudeAdapter {
                     {
                         if !t.is_empty() {
                             title = Some(t.to_string());
+                            if has_forked_from && !t.ends_with(" (Branch)") {
+                                renamed_after_fork = true;
+                            }
                         }
                     }
                 } else if t_type == "ai-title" {
@@ -189,7 +200,10 @@ impl Adapter for ClaudeAdapter {
         let final_title = title
             .or(ai_title)
             .unwrap_or_else(|| one_line(&first_user, 80));
-        let final_title = one_line(&final_title, 120);
+        let mut final_title = one_line(&final_title, 120);
+        if has_forked_from && !renamed_after_fork {
+            final_title = prefix_fork_title(&final_title);
+        }
 
         let mut body = format!("{}\n{}", final_title, body_parts.join("\n"));
         cap_body(&mut body, 1_000_000);
@@ -213,8 +227,14 @@ impl Adapter for ClaudeAdapter {
             body,
             resume: Resume::tab(
                 String::new(), // cwd resolved at index time from the stored cwd
-                vec!["claude".to_string(), "--resume".to_string(), id],
-            ),
+                vec!["claude".to_string(), "--resume".to_string(), id.clone()],
+            )
+            .with_fork(vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                id,
+                "--fork-session".to_string(),
+            ]),
         }))
     }
 }
@@ -264,4 +284,39 @@ fn extract_assistant_text(record: &serde_json::Value) -> String {
         return parts.join("\n");
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forked_claude_session_gets_prefix_until_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude/projects/work");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let f1 = dir.join("fork1.jsonl");
+        std::fs::write(&f1, concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"Parent Chat\"}\n",
+            "{\"type\":\"user\",\"cwd\":\"E:\\\\work\",\"timestamp\":\"2026-11-12T01:00:00Z\",\"forkedFrom\":{\"sessionId\":\"p1\"},\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )).unwrap();
+
+        let f2 = dir.join("fork2.jsonl");
+        std::fs::write(&f2, concat!(
+            "{\"type\":\"user\",\"cwd\":\"E:\\\\work\",\"timestamp\":\"2026-11-12T01:00:00Z\",\"forkedFrom\":{\"sessionId\":\"p1\"},\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"Renamed Fork\"}\n",
+        )).unwrap();
+
+        let mut adapter = ClaudeAdapter;
+        let cands = adapter.candidates(tmp.path()).unwrap();
+        let mut titles = std::collections::HashMap::new();
+        for c in cands {
+            if let Some(p) = adapter.parse(tmp.path(), &c).unwrap() {
+                titles.insert(p.id, p.title);
+            }
+        }
+        assert_eq!(titles["fork1"], "[Fork] Parent Chat");
+        assert_eq!(titles["fork2"], "Renamed Fork");
+    }
 }

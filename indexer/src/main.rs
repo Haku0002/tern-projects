@@ -128,6 +128,10 @@ fn run_index(db_path: &Path, home: &Path) {
         }
     };
 
+    let custom_titles = library::Library::open(db_path)
+        .ok()
+        .and_then(|l| l.custom_titles().ok())
+        .unwrap_or_default();
     let t0 = Instant::now();
     let mut scanned: usize = 0;
     let mut changed: usize = 0;
@@ -138,7 +142,7 @@ fn run_index(db_path: &Path, home: &Path) {
     let mut adapters: Vec<Box<dyn Adapter>> = vec![
         Box::new(adapters::claude::ClaudeAdapter),
         Box::new(adapters::codex::CodexAdapter),
-        Box::new(adapters::omp::OmpAdapter),
+        Box::new(adapters::omp::OmpAdapter::default()),
         Box::new(adapters::pi::PiAdapter),
         Box::new(adapters::opencode::OpenCodeAdapter),
         Box::new(adapters::cursor::CursorAdapter),
@@ -177,6 +181,9 @@ fn run_index(db_path: &Path, home: &Path) {
 
                 match adapter.parse(home, cand) {
                     Ok(Some(mut parsed)) => {
+                        // Codex records the verbatim `--cd` earlier launch plans passed;
+                        // resume tabs and project matching need the legacy spelling.
+                        parsed.cwd = library::simplified(parsed.cwd);
                         // Git resolution.
                         let git_info = git::resolve(&parsed.cwd, &mut git_cache);
                         let project_root = git_info.project_root.clone();
@@ -188,7 +195,7 @@ fn run_index(db_path: &Path, home: &Path) {
                         parsed.resume.cwd = parsed.cwd.clone();
 
                         let resume_json = serde_json::to_string(&parsed.resume)?;
-                        let uid = format!("{}:{}", agent, parsed.id);
+                        let uid = format!("{}:{}", agent, adapter.uid_id(cand, &parsed));
 
                         db::upsert_session(&conn, &db::UpsertData {
                             uid: &uid,
@@ -196,6 +203,7 @@ fn run_index(db_path: &Path, home: &Path) {
                             id: &parsed.id,
                             source: &cand.source,
                             title: &parsed.title,
+                            fts_title: custom_titles.get(&uid).map(String::as_str),
                             cwd: &parsed.cwd,
                             project_root: &project_root,
                             worktree_root: &worktree_root,
@@ -303,8 +311,12 @@ fn run_library(db_path: &Path, home: &Path) -> Result<serde_json::Value> {
             sessions::saved_project(db_path, &home_str, saved["project"]["id"].as_str().context("missing saved project ID")?)
         }
         Request::ProjectRemove { id } => library::Library::open(db_path)?.remove_project(&id),
-        Request::ChatUpdate { uid, pinned, archived, assignment } => {
-            library::Library::open(db_path)?.update_chat(&uid, pinned, archived, assignment)
+        Request::ChatUpdate { uid, pinned, archived, assignment, title } => {
+            let (res, new_title) = library::Library::open(db_path)?.update_chat(&uid, pinned, archived, assignment, title)?;
+            if let Some(custom) = new_title {
+                db::sync_fts_title(db_path, &uid, custom.as_deref())?;
+            }
+            Ok(res)
         }
         Request::Archived { limit, offset } => sessions::archived(db_path, &home_str, limit, offset),
         Request::SettingsUpdate { default_harness, icon_style } => {

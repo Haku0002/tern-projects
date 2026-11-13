@@ -116,7 +116,7 @@ fn lookup(db_path: &Path, uid: &str) -> Result<Chat> {
 fn adapter(agent: &str) -> Result<Box<dyn crate::adapters::Adapter>> {
     use crate::adapters::*;
     Ok(match agent {
-        "omp" => Box::new(omp::OmpAdapter),
+        "omp" => Box::new(omp::OmpAdapter::default()),
         "pi" => Box::new(pi::PiAdapter),
         "claude" => Box::new(claude::ClaudeAdapter),
         "codex" => Box::new(codex::CodexAdapter),

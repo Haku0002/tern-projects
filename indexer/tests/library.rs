@@ -108,6 +108,74 @@ fn uids(value: &Value) -> Vec<&str> {
         .map(|s| s["uid"].as_str().unwrap())
         .collect()
 }
+/// Folders as the backend reports them: canonical, without Windows' verbatim prefix.
+fn resolved(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        Some(legacy) => PathBuf::from(legacy),
+        None => path,
+    }
+}
+/// The verbatim spelling earlier releases stored for Windows folders.
+fn verbatim(path: &Path) -> String {
+    let path = resolved(path).to_string_lossy().into_owned();
+    if cfg!(windows) {
+        format!(r"\\?\{path}")
+    } else {
+        path
+    }
+}
+/// An OMP stand-in that only answers `--help`; the returned PATH hides real installs.
+fn fake_omp(home: &Path) -> std::ffi::OsString {
+    let bin = home.join(".local").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let help = ["omp v0.0.0", "  --cwd DIR", "  --config FILE", "  --add-dir DIR"];
+    #[cfg(windows)]
+    {
+        let script: String = std::iter::once("@echo off".to_owned())
+            .chain(help.map(|line| format!("echo {line}")))
+            .map(|line| line + "\r\n")
+            .collect();
+        std::fs::write(bin.join("omp.cmd"), script).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        std::env::join_paths([system.join(r"WindowsPowerShell\v1.0"), system]).unwrap()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let omp = bin.join("omp");
+        let lines = help.map(|line| format!("'{line}'")).join(" ");
+        std::fs::write(&omp, format!("#!/bin/sh\nprintf '%s\\n' {lines}\n")).unwrap();
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::ffi::OsString::new()
+    }
+}
+fn launch_plan(db: &Path, home: &Path, path: &std::ffi::OsStr, request: Value) -> Value {
+    let mut child = Command::new(BIN)
+        .env("TERN_PROJECTS_HOME", home)
+        .env("PATH", path)
+        .arg("--db")
+        .arg(db)
+        .arg("library")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "request {request}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
 
 #[test]
 fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
@@ -134,7 +202,7 @@ fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
     let snap = snapshot(&db, &home);
     assert_eq!(
         project(&snap, &a)["folders"],
-        json!([app.canonicalize().unwrap(), backend.canonicalize().unwrap()])
+        json!([resolved(&app), resolved(&backend)])
     );
     assert_eq!(
         uids(&project(&snap, &a)["sessions"]),
@@ -372,4 +440,174 @@ fn migration_includes_live_wal_and_refuses_existing_destinations() {
             .unwrap(),
         "in WAL"
     );
+}
+
+#[test]
+fn verbatim_folders_launch_browse_and_match_in_legacy_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("index.sqlite");
+    let primary = home.join("primary");
+    let sub = primary.join("sub");
+    let extra = home.join("extra");
+    for path in [&sub, &extra] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let path_env = fake_omp(&home);
+    let (cwd, sub_cwd, extra_cwd) = (resolved(&primary), resolved(&sub), resolved(&extra));
+    // Harnesses record the verbatim cwd that earlier launch plans passed.
+    seed(&home, "verbatim", Path::new(&verbatim(&sub)), 100);
+    run(&db, &home, &["index"]);
+    // Both spellings name one folder.
+    let id = create(
+        &db,
+        &home,
+        "Verbatim",
+        json!([verbatim(&primary), primary, verbatim(&extra)]),
+    );
+    let conn = rusqlite::Connection::open(temp.path().join("library.sqlite")).unwrap();
+    for (position, folder) in [&primary, &extra].into_iter().enumerate() {
+        conn.execute(
+            "UPDATE project_folders SET path=?1 WHERE project_id=?2 AND position=?3",
+            rusqlite::params![verbatim(folder), id.parse::<i64>().unwrap(), position as i64],
+        )
+        .unwrap();
+    }
+
+    let snap = snapshot(&db, &home);
+    let saved = project(&snap, &id);
+    assert_eq!(saved["folders"], json!([cwd, extra_cwd]));
+    assert_eq!(uids(&saved["sessions"]), ["omp:verbatim"]);
+    assert_eq!(saved["sessions"][0]["cwd"], json!(sub_cwd));
+    assert_eq!(saved["sessions"][0]["resume"]["cwd"], json!(sub_cwd));
+
+    let overlay = resolved(temp.path()).join("omp-new.yml");
+    let plan = launch_plan(
+        &db,
+        &home,
+        &path_env,
+        json!({"op":"launch-plan","harness":"omp","project_id":id}),
+    );
+    assert_eq!(plan["cwd"], json!(cwd));
+    assert_eq!(
+        plan["argv"].as_array().unwrap()[1..],
+        json!(["--cwd", cwd, "--config", overlay, "--add-dir", extra_cwd])
+            .as_array()
+            .unwrap()[..]
+    );
+    assert_eq!(plan["warnings"], json!([]));
+    let plan = launch_plan(
+        &db,
+        &home,
+        &path_env,
+        json!({"op":"launch-plan","harness":"omp","cwd":verbatim(&primary)}),
+    );
+    assert_eq!(plan["cwd"], json!(cwd));
+
+    let browsed = library(
+        &db,
+        &home,
+        json!({"op":"folders","path":verbatim(&home),"cwd":"","offset":0,"limit":100}),
+    );
+    assert_eq!(browsed["path"], json!(resolved(&home)));
+    assert_eq!(browsed["parent"], json!(resolved(temp.path())));
+    let entry = |name: &str| {
+        browsed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()["path"]
+            .clone()
+    };
+    assert_eq!(entry("primary"), json!(cwd));
+
+    // A missing verbatim folder is still the configured folder; saving rewrites it.
+    std::fs::remove_dir(&extra).unwrap();
+    let edited = library(
+        &db,
+        &home,
+        json!({"op":"project-save","id":id,"name":"Verbatim","icon":"folder","folders":saved["folders"]}),
+    );
+    assert_eq!(edited["project"]["folders"], json!([cwd, extra_cwd]));
+    let stored: Vec<String> = conn
+        .prepare("SELECT path FROM project_folders ORDER BY position")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        stored,
+        [cwd.to_str().unwrap(), extra_cwd.to_str().unwrap()]
+    );
+}
+
+#[test]
+fn rename_persists_across_rebuild_syncs_fts_and_migrates_v1_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db = temp.path().join("cache/index.sqlite");
+    let app = home.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    seed(&home, "r1", &app, 100);
+
+    // Seed a legacy v1 library.sqlite before opening with v2 code.
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let lib_path = db.parent().unwrap().join("library.sqlite");
+    let conn = rusqlite::Connection::open(&lib_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,icon TEXT NOT NULL,created_ms INTEGER NOT NULL);
+        CREATE TABLE project_folders(project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position),UNIQUE(project_id,path));
+        CREATE TABLE chat_state(uid TEXT PRIMARY KEY,assignment TEXT NOT NULL DEFAULT 'automatic',project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,pinned_ms INTEGER,archived_ms INTEGER);
+        CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        INSERT INTO chat_state(uid,pinned_ms) VALUES('omp:r1', 123);
+        PRAGMA user_version=1;
+    ",
+    )
+    .unwrap();
+    drop(conn);
+
+    run(&db, &home, &["index"]);
+    let snap = snapshot(&db, &home);
+    assert_eq!(uids(&snap["pinned"]), ["omp:r1"]);
+    assert_eq!(snap["recent"][0]["title"], "shared searchable needle");
+
+    // Rename chat -> reflects in snapshot and FTS query, and survives index rebuild.
+    library(
+        &db,
+        &home,
+        json!({"op":"chat-update","uid":"omp:r1","title":"Custom Renamed Title"}),
+    );
+    let snap = snapshot(&db, &home);
+    assert_eq!(snap["recent"][0]["title"], "Custom Renamed Title");
+    assert_eq!(snap["recent"][0]["custom_title"], true);
+    assert_eq!(
+        uids(&run(&db, &home, &["query", "--q", "Renamed"])["sessions"]),
+        ["omp:r1"]
+    );
+
+    std::fs::remove_file(&db).unwrap();
+    run(&db, &home, &["index"]);
+    let snap = snapshot(&db, &home);
+    assert_eq!(snap["recent"][0]["title"], "Custom Renamed Title");
+    assert_eq!(
+        uids(&run(&db, &home, &["query", "--q", "Renamed"])["sessions"]),
+        ["omp:r1"]
+    );
+
+    // Clearing title with null reverts to the original disk title in both snapshot and FTS.
+    library(
+        &db,
+        &home,
+        json!({"op":"chat-update","uid":"omp:r1","title":null}),
+    );
+    let snap = snapshot(&db, &home);
+    assert_eq!(snap["recent"][0]["title"], "shared searchable needle");
+    assert!(snap["recent"][0].get("custom_title").is_none());
+    assert!(run(&db, &home, &["query", "--q", "Renamed"])["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }

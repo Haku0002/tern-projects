@@ -58,6 +58,15 @@ pub fn one_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Prepends `[Fork] ` onto an unrenamed forked chat title unless already present, staying within 120 chars.
+pub fn prefix_fork_title(title: &str) -> String {
+    let trimmed = title.trim_start();
+    if trimmed.starts_with("[Fork]") {
+        return one_line(trimmed, 120);
+    }
+    one_line(&format!("[Fork] {trimmed}"), 120)
+}
+
 /// Truncate `s` to `max_bytes` on a char boundary, appending nothing (used for body text).
 pub fn cap_body(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
@@ -241,5 +250,16 @@ mod tests {
     #[test]
     fn one_line_collapses() {
         assert_eq!(one_line("  foo   bar  ", 100), "foo bar");
+    }
+
+    #[test]
+    fn prefix_fork_title_adds_once_and_caps() {
+        assert_eq!(prefix_fork_title("Design cache"), "[Fork] Design cache");
+        assert_eq!(prefix_fork_title("[Fork] Design cache"), "[Fork] Design cache");
+        assert_eq!(prefix_fork_title("  [Fork] Design cache  "), "[Fork] Design cache");
+        let long = "a".repeat(130);
+        let prefixed = prefix_fork_title(&long);
+        assert!(prefixed.starts_with("[Fork] "));
+        assert!(prefixed.chars().count() <= 120);
     }
 }

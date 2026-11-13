@@ -22,6 +22,9 @@ pub fn resolve(cwd: &str, cache: &mut HashMap<String, GitInfo>) -> GitInfo {
 }
 
 fn resolve_inner(cwd: &str) -> GitInfo {
+    // Roots are stored, compared and displayed; derive them from the legacy spelling.
+    let legacy = crate::library::legacy_spelling(Path::new(cwd));
+    let cwd = legacy.as_deref().unwrap_or(cwd);
     let start = Path::new(cwd);
 
     // Walk up from cwd, skipping non-existent leaf components.

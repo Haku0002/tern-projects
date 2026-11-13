@@ -147,6 +147,14 @@
 	/* Header, toolbars, search ----------------------------------------------------- */
 	.tp-top { display: flex; }
 	.tp-top .tp-nav { flex: 1 1 auto; }
+	.tp-top > .tp-btn.icon { flex: 0 0 auto; margin-left: 4px; }
+	/* Collapsed sidebar: a narrow icon rail (expand, views, New chat). */
+	.tp-strip { display: flex; flex-direction: column; align-items: center; gap: 4px; padding-top: 6px; }
+	/* Collapsed sidebar as a tile: a card over the main chat (Expand, latest chats, New chat). */
+	.tp-tile { display: flex; flex-direction: column; align-items: stretch; gap: 4px; padding: 8px; }
+	.tp-tile > .tp-btn { justify-content: flex-start; min-width: 0; }
+	.tp-tile > .tp-btn .tp-btn-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.tp-tile > .tp-btn.primary { justify-content: center; min-height: 36px; font-size: 1.1em; }
 	.tp-bar { display: flex; align-items: center; gap: 6px; min-width: 0; }
 	.tp-spin { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; color: var(--t3); }
 	.tp-caption { display: flex; align-items: center; gap: 4px; min-height: 22px; margin: -2px 0 -4px 2px; }
@@ -234,6 +242,9 @@
 	}
 	.tp-sec-h:first-child { padding-top: 2px; }
 	.tp-sec-h .tp-sec-l { flex: 1 1 auto; }
+	.tp-sec-h .tp-sec-a { display: inline-flex; align-items: center; gap: 2px; }
+	.tp-sec-h .tp-btn.fold .sf-icon { transform: rotate(-90deg); transition: transform 140ms var(--ease); }
+	.tp-sec-h .tp-btn.fold.open .sf-icon { transform: rotate(0deg); }
 
 	/* Empty states and banners ----------------------------------------------------- */
 	.tp-empty {

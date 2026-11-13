@@ -315,7 +315,7 @@ fn label(id: &str) -> &str {
 }
 
 fn readable_directory(path: &str) -> Result<PathBuf> {
-    let path = fs::canonicalize(path)?;
+    let path = crate::library::canonical(Path::new(path))?;
     if !path.is_dir() {
         bail!("not a directory");
     }
@@ -460,7 +460,7 @@ fn omp_overlay(db_path: &Path) -> Result<String> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent).context("Cannot create plugin data directory")?;
-    let path = fs::canonicalize(parent)?.join("omp-new.yml");
+    let path = crate::library::canonical(parent)?.join("omp-new.yml");
     safe_text(path_text(&path)?, "OMP overlay path")?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);

@@ -2,7 +2,9 @@ use anyhow::Context;
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// 2: session cwd and Git roots never use the Windows verbatim `\\?\` spelling.
+/// 3: forked chats prefix `[Fork] ` onto unrenamed titles.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Serialize first-open journal changes as well as transactional schema creation.
 /// SQLite's journal-mode transition can return BUSY without invoking its busy handler.
@@ -90,9 +92,9 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
             title, body,
             tokenize='unicode61 remove_diacritics 2'
         );
-        PRAGMA user_version=1;
     ",
     )?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
 }
@@ -114,6 +116,7 @@ pub struct UpsertData<'a> {
     pub source: &'a str,
     pub title: &'a str,
     pub cwd: &'a str,
+    pub fts_title: Option<&'a str>,
     pub project_root: &'a str,
     pub worktree_root: &'a str,
     pub branch: Option<&'a str>,
@@ -128,6 +131,16 @@ pub struct UpsertData<'a> {
 }
 
 pub fn upsert_session(conn: &Connection, d: &UpsertData<'_>) -> anyhow::Result<()> {
+    // One row per source: a source now indexed under another uid (an OMP file that joined a chain, whose
+    // uid is the chain's first session) drops its old row.
+    let moved: Vec<i64> = conn
+        .prepare("SELECT rowid FROM sessions WHERE source = ?1 AND uid <> ?2")?
+        .query_map(params![d.source, d.uid], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for rowid in moved {
+        conn.execute("DELETE FROM sessions_fts WHERE rowid = ?1", params![rowid])?;
+        conn.execute("DELETE FROM sessions WHERE rowid = ?1", params![rowid])?;
+    }
     // Delete old FTS row if the session already exists.
     let old_rowid: Option<i64> = conn
         .query_row(
@@ -166,7 +179,7 @@ pub fn upsert_session(conn: &Connection, d: &UpsertData<'_>) -> anyhow::Result<(
 
     conn.execute(
         "INSERT INTO sessions_fts(rowid, title, body) VALUES(?1, ?2, ?3)",
-        params![new_rowid, d.title, d.body],
+        params![new_rowid, d.fts_title.unwrap_or(d.title), d.body],
     )?;
 
     conn.execute(
@@ -209,6 +222,31 @@ pub fn upsert_source_only(
     Ok(())
 }
 
+
+/// Update a single row's FTS5 title to match `custom_title` (or revert to `sessions.title` when `None`).
+pub fn sync_fts_title(db_path: &Path, uid: &str, custom_title: Option<&str>) -> anyhow::Result<()> {
+    if !db_path.is_file() {
+        return Ok(());
+    }
+    let mut conn = open(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT rowid, title FROM sessions WHERE uid = ?1",
+            params![uid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    if let Some((rowid, original_title)) = row {
+        let effective = custom_title.filter(|t| !t.is_empty()).unwrap_or(&original_title);
+        tx.execute(
+            "UPDATE sessions_fts SET title = ?1 WHERE rowid = ?2",
+            params![effective, rowid],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 /// Remove all sources (and their sessions) for `agent` whose source is not in `live`.
 pub fn remove_stale(conn: &Connection, agent: &str, live: &[String]) -> anyhow::Result<usize> {
     // Get all sources for this agent.

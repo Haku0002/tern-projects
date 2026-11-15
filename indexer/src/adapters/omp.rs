@@ -339,6 +339,7 @@ where
     let mut last_assistant = String::new();
     let mut body_parts: Vec<String> = Vec::new();
     let mut messages: i64 = 0;
+    let mut last_user_ms: Option<i64> = None;
 
     for line in content.lines() {
         if line.trim().is_empty() { continue; }
@@ -397,6 +398,7 @@ where
                 let text = extract_content_text(msg);
                 if let Some(t) = text.and_then(|t| clean_user(&t)) {
                     if first_user.is_none() { first_user = Some(t.clone()); }
+                    if ts_ms > last_user_ms { last_user_ms = ts_ms; }
                     body_parts.push(t);
                     messages += 1;
                 }
@@ -441,6 +443,11 @@ where
                     && last_title_change_ms.is_some_and(|t| t > r + 1500);
                 title_renamed || change_renamed
             });
+            // A fork nobody wrote in holds only its parent's copied history: listing it would show the
+            // same chat twice. It appears once a message is sent in it.
+            if is_fork && !matches!((last_user_ms, root_ms), (Some(u), Some(r)) if u >= r) {
+                return Ok(None);
+            }
             if is_fork && !renamed_after_fork {
                 title = prefix_fork_title(&title);
             }
@@ -602,6 +609,15 @@ mod tests {
             "{\"type\":\"title\",\"v\":1,\"title\":\"Unity Dev\",\"source\":\"user\",\"updatedAt\":\"2026-11-12T03:39:39.472Z\"}\n",
             "{\"type\":\"session\",\"version\":3,\"id\":\"F1\",\"timestamp\":\"2026-11-12T03:39:39.470Z\",\"cwd\":\"E:\\\\work\",\"parentSession\":\"P1\",\"providerPromptCacheKey\":\"P1\",\"title\":\"Unity Dev\"}\n",
             "{\"type\":\"message\",\"id\":\"e1\",\"timestamp\":\"2026-11-10T01:00:05Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+            "{\"type\":\"message\",\"id\":\"f1\",\"timestamp\":\"2026-11-12T03:40:00Z\",\"message\":{\"role\":\"user\",\"content\":\"go on\"}}\n",
+        )).unwrap();
+
+        // A fork opened and closed without a message: only the parent's copied history.
+        std::fs::write(sess.join("fork_empty.jsonl"), concat!(
+            "{\"type\":\"title\",\"v\":1,\"title\":\"Unity Dev\",\"source\":\"user\",\"updatedAt\":\"2026-11-12T06:00:00.002Z\"}\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"F3\",\"timestamp\":\"2026-11-12T06:00:00Z\",\"cwd\":\"E:\\\\work\",\"parentSession\":\"P1\",\"providerPromptCacheKey\":\"P1\",\"title\":\"Unity Dev\"}\n",
+            "{\"type\":\"message\",\"id\":\"e1\",\"timestamp\":\"2026-11-10T01:00:05Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+            "{\"type\":\"custom\",\"customType\":\"session_exit\",\"id\":\"z1\",\"timestamp\":\"2026-11-12T06:00:09Z\"}\n",
         )).unwrap();
 
         // User-renamed fork: title updated > 1.5s after fork creation.
@@ -609,6 +625,7 @@ mod tests {
             "{\"type\":\"title\",\"v\":1,\"title\":\"Custom Branch Name\",\"source\":\"user\",\"updatedAt\":\"2026-11-12T04:00:00Z\"}\n",
             "{\"type\":\"session\",\"version\":3,\"id\":\"F2\",\"timestamp\":\"2026-11-12T03:39:39Z\",\"cwd\":\"E:\\\\work\",\"parentSession\":\"P1\",\"providerPromptCacheKey\":\"P1\"}\n",
             "{\"type\":\"message\",\"id\":\"e1\",\"timestamp\":\"2026-11-10T01:00:05Z\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+            "{\"type\":\"message\",\"id\":\"f2\",\"timestamp\":\"2026-11-12T04:01:00Z\",\"message\":{\"role\":\"user\",\"content\":\"branch work\"}}\n",
         )).unwrap();
 
         // `/new` session: parentSession present, fresh entry id and later timestamp -> NOT a fork.
@@ -630,5 +647,7 @@ mod tests {
         assert_eq!(titles["F1"], "[Fork] Unity Dev");
         assert_eq!(titles["F2"], "Custom Branch Name");
         assert_eq!(titles["N1"], "Fresh Chat");
+        // The parent already shows everything the empty fork holds.
+        assert!(!titles.contains_key("F3"));
     }
 }

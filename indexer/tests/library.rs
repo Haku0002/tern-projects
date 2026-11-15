@@ -204,9 +204,10 @@ fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
         project(&snap, &a)["folders"],
         json!([resolved(&app), resolved(&backend)])
     );
+    // `sub` lies in both A (via `app`) and B; only the more specific project B lists it.
     assert_eq!(
         uids(&project(&snap, &a)["sessions"]),
-        ["omp:back", "omp:sub", "omp:app"]
+        ["omp:back", "omp:app"]
     );
     assert_eq!(uids(&project(&snap, &b)["sessions"]), ["omp:sub"]);
     assert_eq!(project(&snap, &c)["count"], 0);
@@ -264,7 +265,7 @@ fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
     let snap = snapshot(&db, &home);
     assert!(uids(&snap["pinned"]).is_empty());
     assert!(!uids(&snap["recent"]).contains(&"omp:app"));
-    assert_eq!(project(&snap, &a)["count"], 2);
+    assert_eq!(project(&snap, &a)["count"], 1);
     assert_eq!(run(&db, &home, &["query", "--q", "needle"])["total"], 3);
     assert_eq!(
         uids(&library(&db, &home, json!({"op":"archived","limit":50,"offset":0}))["sessions"]),
@@ -277,7 +278,7 @@ fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
     let snap = snapshot(&db, &home);
     assert_eq!(snap["settings"]["default_harness"], "omp");
     assert_eq!(snap["settings"]["icon_style"], "monochrome");
-    assert_eq!(project(&snap, &a)["count"], 2);
+    assert_eq!(project(&snap, &a)["count"], 1);
     library(
         &db,
         &home,
@@ -299,7 +300,7 @@ fn membership_overrides_pins_archive_and_rebuild_are_consistent() {
     library(&db, &home, json!({"op":"project-remove","id":c}));
     assert!(source.exists());
     let after_removal = snapshot(&db, &home);
-    assert_eq!(project(&after_removal, &a)["count"], 3);
+    assert_eq!(project(&after_removal, &a)["count"], 2);
     assert_eq!(project(&after_removal, &b)["count"], 1);
     library(
         &db,

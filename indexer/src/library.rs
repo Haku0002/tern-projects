@@ -843,6 +843,8 @@ pub struct Membership {
     folders: HashMap<String, Vec<PathBuf>>,
     paths: HashMap<String, PathBuf>,
     retained: HashMap<String, HashSet<String>>,
+    /// `uid\0cwd` -> projects an automatic chat belongs to.
+    owners: HashMap<String, Vec<String>>,
 }
 fn normalized(path: &str) -> PathBuf {
     let path = canonical(Path::new(path)).unwrap_or_else(|_| {
@@ -879,6 +881,7 @@ impl Membership {
             folders,
             paths: HashMap::new(),
             retained: HashMap::new(),
+            owners: HashMap::new(),
         }
     }
     pub fn matches(
@@ -892,20 +895,53 @@ impl Membership {
         match assignment {
             "none" => false,
             "project" => project_id.parse::<i64>().ok() == assigned,
-            _ => {
-                if self.retained.get(project_id).is_some_and(|uids| uids.contains(uid)) {
-                    return true;
-                }
-                if !self.paths.contains_key(cwd) {
-                    self.paths.insert(cwd.to_owned(), normalized(cwd));
-                }
-                let path = &self.paths[cwd];
-                path.is_absolute()
-                    && self.folders.get(project_id).is_some_and(|folders| {
-                        folders.iter().any(|folder| path.starts_with(folder))
-                    })
-            }
+            _ => self.automatic(uid, cwd).iter().any(|p| p == project_id),
         }
+    }
+    /// An automatic chat belongs to the projects that retained it and to the project whose folder holds its
+    /// cwd most specifically, so nested projects (`E:\Dev` and `E:\Dev\App`) don't both list it.
+    fn automatic(&mut self, uid: &str, cwd: &str) -> &[String] {
+        let key = format!("{uid}\0{cwd}");
+        if !self.owners.contains_key(&key) {
+            let path = self
+                .paths
+                .entry(cwd.to_owned())
+                .or_insert_with(|| normalized(cwd));
+            let mut out: Vec<String> = self
+                .retained
+                .iter()
+                .filter(|(_, uids)| uids.contains(uid))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if path.is_absolute() {
+                let mut best = 0;
+                let mut hits: Vec<&String> = Vec::new();
+                for (id, folders) in &self.folders {
+                    let Some(depth) = folders
+                        .iter()
+                        .filter(|folder| path.starts_with(folder))
+                        .map(|folder| folder.components().count())
+                        .max()
+                    else {
+                        continue;
+                    };
+                    if depth > best {
+                        best = depth;
+                        hits.clear();
+                    }
+                    if depth == best {
+                        hits.push(id);
+                    }
+                }
+                for id in hits {
+                    if !out.contains(id) {
+                        out.push(id.clone());
+                    }
+                }
+            }
+            self.owners.insert(key.clone(), out);
+        }
+        &self.owners[&key]
     }
 }
 
@@ -968,5 +1004,35 @@ mod tests {
         for path in [r"\\?\C:\Users\me", "/tmp/project"] {
             assert_eq!(simplified(path.to_owned()), path);
         }
+    }
+
+    #[test]
+    fn automatic_chats_belong_to_the_most_specific_project_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("Dev");
+        let inner = outer.join("App");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        let project = |id: &str, folder: &Path| Project {
+            id: id.into(),
+            name: id.into(),
+            icon: "folder".into(),
+            folders: vec![folder.to_string_lossy().into_owned()],
+            created_ms: 0,
+        };
+        let mut m = Membership::new(vec![project("1", &outer), project("2", &inner), project("3", &inner)]);
+        let deep = inner.join("src").to_string_lossy().into_owned();
+        let shallow = outer.to_string_lossy().into_owned();
+        // Inside the nested project: listed there (and in its exact twin), not in the enclosing one.
+        assert!(!m.matches("1", "u1", &deep, "automatic", None));
+        assert!(m.matches("2", "u1", &deep, "automatic", None));
+        assert!(m.matches("3", "u1", &deep, "automatic", None));
+        // Outside it: only the enclosing project.
+        assert!(m.matches("1", "u2", &shallow, "automatic", None));
+        assert!(!m.matches("2", "u2", &shallow, "automatic", None));
+        // Explicit and retained placement still win.
+        assert!(m.matches("1", "u1", &deep, "project", Some(1)));
+        m.retained.entry("1".into()).or_default().insert("u3".into());
+        assert!(m.matches("1", "u3", &deep, "automatic", None));
+        assert!(m.matches("2", "u3", &deep, "automatic", None));
     }
 }

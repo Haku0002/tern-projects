@@ -4,7 +4,8 @@ use std::path::Path;
 
 /// 2: session cwd and Git roots never use the Windows verbatim `\\?\` spelling.
 /// 3: forked chats prefix `[Fork] ` onto unrenamed titles.
-pub const SCHEMA_VERSION: i64 = 3;
+/// 4: OMP forks without a message of their own are not listed.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Serialize first-open journal changes as well as transactional schema creation.
 /// SQLite's journal-mode transition can return BUSY without invoking its busy handler.
